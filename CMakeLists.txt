@@ -27,6 +27,8 @@ endif()
 # ---------------------------------------------------------------------------
 find_package(OpenSSL REQUIRED)
 find_package(Nghttp2 REQUIRED)
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(ProtobufLite REQUIRED IMPORTED_TARGET protobuf-lite)
@@ -69,10 +71,13 @@ target_link_libraries(egrpc_deps INTERFACE
   OpenSSL::Crypto
   nghttp2::nghttp2
   PkgConfig::ProtobufLite
+  Threads::Threads
 )
 
 add_library(egrpc_objects OBJECT ${EGRPC_SOURCES})
 set_target_properties(egrpc_objects PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# Internal headers live next to the sources (src/transport/..., src/core/...).
+target_include_directories(egrpc_objects PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(egrpc_objects PUBLIC egrpc_deps)
 target_link_libraries(egrpc_objects PRIVATE egrpc_warnings)
 
@@ -103,6 +108,7 @@ option(EGRPC_BUILD_TESTS "Build unit tests" ${_egrpc_is_top})
 if(EGRPC_BUILD_TESTS)
   include(CTest)
   add_subdirectory(tests/unit)
+  add_subdirectory(tests/integration)
 endif()
 
 # ---------------------------------------------------------------------------

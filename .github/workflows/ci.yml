@@ -39,6 +39,42 @@ jobs:
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: ctest --test-dir build --output-on-failure
 
+  # TSan is mandatory from M1 on (design §9): the condvar-heavy threading
+  # model makes data races the top project risk.
+  sanitize-thread:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libnghttp2-dev libssl-dev libprotobuf-dev pkg-config
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DEGRPC_SANITIZE=thread
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        env:
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+        run: ctest --test-dir build --output-on-failure
+
+  # Ring-3 style integration: pytest harness drives the built probe binary
+  # against Python TLS servers (M1 acceptance: ALPN h2 / clean failures).
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libnghttp2-dev libssl-dev libprotobuf-dev pkg-config python3-pytest
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build -j
+      - name: Run pytest harness
+        run: python3 -m pytest tests -v
+
   format:
     runs-on: ubuntu-latest
     steps:

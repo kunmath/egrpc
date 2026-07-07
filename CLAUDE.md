@@ -66,7 +66,7 @@ per egrpc release**, verified in CI by regenerating stubs and compiling.
 ## Milestones (design §8)
 
 - **M0 — Scaffold (CMake, pin-codegen.sh, CI, test skeleton): done**
-- M1 — Transport bring-up (TlsSocket, Wakeup, TimerHeap, EventThread skeleton): not started
+- **M1 — Transport bring-up (TlsSocket, Wakeup, TimerHeap, EventThread skeleton): done**
 - M2 — HTTP/2 session + keepalive plumbing: not started
 - M3 — Hand-rolled unary call end-to-end: not started
 - M4 — Shim: unary via unmodified generated stubs: not started

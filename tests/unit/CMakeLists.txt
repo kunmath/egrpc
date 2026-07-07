@@ -6,10 +6,19 @@
 # scope, and mark the doctest include dir SYSTEM so the vendored header is
 # exempt from -Werror.
 
-add_executable(egrpc_unit_tests test_sanity.cc)
+add_executable(egrpc_unit_tests
+  test_sanity.cc
+  test_timer_heap.cc
+  test_wakeup.cc
+  test_event_thread.cc
+)
 
 target_include_directories(egrpc_unit_tests SYSTEM PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party)
+# Unit tests exercise internal headers directly (src/transport, src/core).
+target_include_directories(egrpc_unit_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+target_link_libraries(egrpc_unit_tests PRIVATE egrpc_static)
 
 target_compile_options(egrpc_unit_tests PRIVATE -Wall -Wextra -Werror)
 
