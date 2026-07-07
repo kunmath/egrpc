@@ -1,0 +1,24 @@
+# Build directories
+build/
+build-*/
+cmake-build-*/
+
+# Pinned codegen tool outputs
+tools/bin/
+tools/include/
+tools/.pin-codegen-work/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Build metadata / caches
+compile_commands.json
+.cache/
+
+# Editor droppings
+.idea/
+.vscode/
+*.swp

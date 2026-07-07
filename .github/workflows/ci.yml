@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libnghttp2-dev libssl-dev libprotobuf-dev pkg-config
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  sanitize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libnghttp2-dev libssl-dev libprotobuf-dev pkg-config
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DEGRPC_SANITIZE=address,undefined
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        env:
+          ASAN_OPTIONS: strict_string_checks=1:detect_leaks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --test-dir build --output-on-failure
+
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang-format-18
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-format-18
+      - name: Check formatting
+        run: |
+          files=$(git ls-files '*.h' '*.cc' | grep -v '^third_party/' || true)
+          if [ -z "$files" ]; then
+            echo "No files to check."
+            exit 0
+          fi
+          echo "$files" | xargs clang-format-18 --dry-run --Werror
+
+  codegen-tools:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache pinned codegen tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            tools/bin
+            tools/include
+            tools/.pin-codegen-work
+          key: pin-codegen-${{ hashFiles('tools/pin-codegen.sh') }}
+      - name: Build pinned codegen tools
+        run: tools/pin-codegen.sh
+      - name: Verify protoc
+        run: tools/bin/protoc --version
