@@ -28,7 +28,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libnghttp2-dev libssl-dev libprotobuf-dev pkg-config
+          sudo apt-get install -y libnghttp2-dev libssl-dev libprotobuf-dev pkg-config python3-venv
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DEGRPC_SANITIZE=address,undefined
       - name: Build
@@ -38,6 +38,16 @@ jobs:
           ASAN_OPTIONS: strict_string_checks=1:detect_leaks=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: ctest --test-dir build --output-on-failure
+      # The integration probes exercise the EventThread⇄Http2Session⇄timer
+      # interplay end-to-end; run them sanitized too, not just the unit tests.
+      - name: Integration harness (sanitized probes)
+        env:
+          ASAN_OPTIONS: strict_string_checks=1:detect_leaks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install pytest h2
+          .venv/bin/pytest tests -v
 
   # TSan is mandatory from M1 on (design §9): the condvar-heavy threading
   # model makes data races the top project risk.
@@ -67,13 +77,16 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libnghttp2-dev libssl-dev libprotobuf-dev pkg-config python3-pytest
+          sudo apt-get install -y libnghttp2-dev libssl-dev libprotobuf-dev pkg-config python3-venv
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
       - name: Build
         run: cmake --build build -j
       - name: Run pytest harness
-        run: python3 -m pytest tests -v
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install pytest h2
+          .venv/bin/pytest tests -v
 
   format:
     runs-on: ubuntu-latest

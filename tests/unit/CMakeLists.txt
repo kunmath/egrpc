@@ -11,6 +11,7 @@ add_executable(egrpc_unit_tests
   test_timer_heap.cc
   test_wakeup.cc
   test_event_thread.cc
+  test_http2_session.cc
 )
 
 target_include_directories(egrpc_unit_tests SYSTEM PRIVATE
