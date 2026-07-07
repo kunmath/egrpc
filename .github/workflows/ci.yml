@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 jobs:
   build-test:
@@ -55,7 +56,11 @@ jobs:
           fi
           echo "$files" | xargs clang-format-18 --dry-run --Werror
 
+  # Builds the pinned toolchain from source (~6+ min uncached), so to save
+  # runner minutes it only runs when manually dispatched from the Actions tab.
+  # Re-enable per-push (drop the `if`) once minutes are not a concern.
   codegen-tools:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
