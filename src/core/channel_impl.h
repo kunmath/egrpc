@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -34,7 +35,14 @@ struct ChannelOptions {
   Http2SessionOptions http2;
   // Receive-path bound for the per-call reassembly scanner (design §4.3).
   size_t max_receive_message_size = 4 * 1024 * 1024;
+  // Send-path bound, enforced before submission with kResourceExhausted.
+  // Default unlimited, matching upstream; GRPC_ARG_MAX_SEND_MESSAGE_LENGTH
+  // maps here (§4.5).
+  size_t max_send_message_size = std::numeric_limits<size_t>::max();
   std::chrono::milliseconds connect_timeout{20000};
+  // Prepended to the built-in user-agent (§5.1); upstream's
+  // GRPC_ARG_PRIMARY_USER_AGENT maps here.
+  std::string user_agent_prefix;
 };
 
 class ChannelImpl {
@@ -48,10 +56,13 @@ class ChannelImpl {
   ChannelImpl& operator=(const ChannelImpl&) = delete;
 
   // Blocking unary call, safe from any thread. `request` is the serialized
-  // request message (protobuf-lite bytes; framing is added here). `timeout`
-  // becomes the grpc-timeout header when set (local deadline timers land in
-  // M5). Returns the full result: status, response bytes, metadata.
+  // request message (protobuf-lite bytes; framing is added here). `metadata`
+  // is the caller's initial metadata, raw: keys are lowercased and `-bin`
+  // values base64-encoded on the way to the wire (§5.1). `timeout` becomes
+  // the grpc-timeout header when set (local deadline timers land in M5).
+  // Returns the full result: status, response bytes, metadata.
   CallState::Result UnaryCall(const std::string& method_path, std::string request,
+                              Http2Session::HeaderList metadata = {},
                               std::optional<std::chrono::nanoseconds> timeout = std::nullopt);
 
   // Design §5.7 (M3 subset): refuse new calls with kUnavailable, fail
@@ -69,6 +80,7 @@ class ChannelImpl {
     std::shared_ptr<CallState> call;
     std::string method_path;
     std::string framed_body;
+    Http2Session::HeaderList metadata;
     std::optional<std::chrono::nanoseconds> timeout;
   };
 

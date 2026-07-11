@@ -28,7 +28,18 @@ ChannelImpl::ChannelImpl(std::string host, uint16_t port, TlsConfig tls, Channel
 ChannelImpl::~ChannelImpl() { Shutdown(); }
 
 CallState::Result ChannelImpl::UnaryCall(const std::string& method_path, std::string request,
+                                         Http2Session::HeaderList metadata,
                                          std::optional<std::chrono::nanoseconds> timeout) {
+  // Send-path bound (§4.5): checked before anything is queued, so the
+  // caller gets kResourceExhausted without a wire exchange, like upstream.
+  if (request.size() > options_.max_send_message_size) {
+    CallState::Result result;
+    result.code = StatusCode::kResourceExhausted;
+    result.message = "Sent message larger than max (" + std::to_string(request.size()) + " vs. " +
+                     std::to_string(options_.max_send_message_size) + ")";
+    return result;
+  }
+
   auto call = std::make_shared<CallState>(options_.max_receive_message_size);
 
   // shared_ptr wrapper: std::function requires copyable callables, and the
@@ -38,6 +49,7 @@ CallState::Result ChannelImpl::UnaryCall(const std::string& method_path, std::st
   pc->method_path = method_path;
   AppendGrpcFramePrefix(request.size(), &pc->framed_body);
   pc->framed_body += request;
+  pc->metadata = std::move(metadata);
   pc->timeout = timeout;
 
   if (!loop_ok_ || !loop_.Post([this, pc] { HandleNewCall(std::move(*pc)); })) {
@@ -165,8 +177,8 @@ void ChannelImpl::SubmitCall(PendingCall pc) {
     return;
   }
 
-  const Http2Session::HeaderList headers =
-      BuildRequestHeaders(authority_, pc.method_path, pc.timeout);
+  const Http2Session::HeaderList headers = BuildRequestHeaders(
+      authority_, pc.method_path, pc.timeout, pc.metadata, options_.user_agent_prefix);
 
   Http2Session::StreamHooks hooks = CallState::MakeStreamHooks(pc.call);
   // Wrap on_close to also drop the channel's reference to the call.

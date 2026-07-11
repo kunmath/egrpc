@@ -54,7 +54,8 @@ set(EGRPC_SOURCES
   src/core/call_state.cc
   src/core/grpc_wire.cc
   src/core/backoff.cc
-  src/api/serialization.cc
+  src/api/channel.cc
+  src/api/create_channel.cc
 )
 
 # ---------------------------------------------------------------------------
@@ -110,6 +111,12 @@ if(EGRPC_BUILD_TESTS)
   include(CTest)
   add_subdirectory(tests/unit)
   add_subdirectory(tests/integration)
+endif()
+
+option(EGRPC_BUILD_EXAMPLES "Build examples (M4 shim acceptance)" ${_egrpc_is_top})
+
+if(EGRPC_BUILD_EXAMPLES)
+  add_subdirectory(examples/route_guide)
 endif()
 
 # ---------------------------------------------------------------------------

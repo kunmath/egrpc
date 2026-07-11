@@ -21,19 +21,56 @@ bool IsGrpcContentType(const std::string& value) {
   return value.compare(0, 16, "application/grpc") == 0;
 }
 
+std::string AsciiLower(std::string s) {
+  for (char& c : s) {
+    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+  }
+  return s;
+}
+
+bool IsBinKey(const std::string& key) {
+  return key.size() >= 4 && key.compare(key.size() - 4, 4, "-bin") == 0;
+}
+
+// Keys the transport owns (§5.1). Caller metadata colliding with these (or
+// naming a pseudo-header) would produce a duplicate/misplaced HTTP/2 header
+// and fail the whole call opaquely inside nghttp2, so it is dropped here —
+// upstream likewise refuses reserved keys rather than sending them.
+bool IsReservedMetadataKey(const std::string& key) {
+  if (!key.empty() && key[0] == ':') return true;
+  static constexpr const char* kReserved[] = {
+      "te",           "host",          "content-type",         "user-agent",
+      "grpc-timeout", "grpc-encoding", "grpc-accept-encoding",
+  };
+  for (const char* r : kReserved) {
+    if (key == r) return true;
+  }
+  return false;
+}
+
 }  // namespace
 
 Http2Session::HeaderList BuildRequestHeaders(const std::string& authority,
                                              const std::string& method_path,
-                                             std::optional<std::chrono::nanoseconds> timeout) {
+                                             std::optional<std::chrono::nanoseconds> timeout,
+                                             const Http2Session::HeaderList& metadata,
+                                             const std::string& user_agent_prefix) {
+  const std::string user_agent =
+      user_agent_prefix.empty() ? kUserAgent : user_agent_prefix + " " + kUserAgent;
   Http2Session::HeaderList headers = {
       {":method", "POST"},        {":scheme", "https"},
       {":path", method_path},     {":authority", authority},
       {"te", "trailers"},         {"content-type", "application/grpc"},
-      {"user-agent", kUserAgent}, {"grpc-accept-encoding", "identity"},
+      {"user-agent", user_agent}, {"grpc-accept-encoding", "identity"},
   };
   if (timeout.has_value()) {
     headers.emplace_back("grpc-timeout", EncodeGrpcTimeout(*timeout));
+  }
+  for (const auto& kv : metadata) {
+    std::string key = AsciiLower(kv.first);
+    if (IsReservedMetadataKey(key)) continue;
+    std::string value = IsBinKey(key) ? Base64Encode(kv.second) : kv.second;
+    headers.emplace_back(std::move(key), std::move(value));
   }
   return headers;
 }

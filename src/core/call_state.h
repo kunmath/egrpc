@@ -32,11 +32,19 @@ namespace internal {
 
 // Builds the request HEADERS for a call (design §5.1): :method POST,
 // :scheme https, :authority, :path, te: trailers, content-type,
-// grpc-accept-encoding: identity, user-agent, and grpc-timeout when a
-// timeout is given. Pseudo-headers come first as HTTP/2 requires.
+// grpc-accept-encoding: identity, user-agent, grpc-timeout when a timeout
+// is given, then the caller's metadata. Pseudo-headers come first as HTTP/2
+// requires. Metadata keys are lowercased here and values of `-bin` keys are
+// base64-encoded without padding (§5.1), so callers pass them raw; keys the
+// transport owns (pseudo-headers, te, content-type, grpc-timeout, ...) are
+// dropped rather than sent as duplicates. A non-empty `user_agent_prefix`
+// is prepended to the built-in user-agent, space-separated, matching
+// upstream's primary_user_agent semantics.
 Http2Session::HeaderList BuildRequestHeaders(const std::string& authority,
                                              const std::string& method_path,
-                                             std::optional<std::chrono::nanoseconds> timeout);
+                                             std::optional<std::chrono::nanoseconds> timeout,
+                                             const Http2Session::HeaderList& metadata = {},
+                                             const std::string& user_agent_prefix = {});
 
 class CallState {
  public:

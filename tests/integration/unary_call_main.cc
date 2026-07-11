@@ -88,7 +88,7 @@ int main(int argc, char** argv) {
       return 1;
     }
 
-    const egrpc::internal::CallState::Result result = channel.UnaryCall(path, request, timeout);
+    const egrpc::internal::CallState::Result result = channel.UnaryCall(path, request, {}, timeout);
 
     std::printf("STATUS code=%d message=%s\n", static_cast<int>(result.code),
                 result.message.c_str());

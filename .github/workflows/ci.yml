@@ -98,7 +98,9 @@ jobs:
           sudo apt-get install -y clang-format-18
       - name: Check formatting
         run: |
-          files=$(git ls-files '*.h' '*.cc' | grep -v '^third_party/' || true)
+          # third_party is vendored; examples/*/gen is protoc/grpc_cpp_plugin
+          # output checked in verbatim (M4) — neither is ours to format.
+          files=$(git ls-files '*.h' '*.cc' | grep -v -e '^third_party/' -e '^examples/.*/gen/' || true)
           if [ -z "$files" ]; then
             echo "No files to check."
             exit 0
@@ -126,3 +128,14 @@ jobs:
         run: tools/pin-codegen.sh
       - name: Verify protoc
         run: tools/bin/protoc --version
+      # M4 acceptance (design §8): the checked-in .grpc.pb.* stubs must be
+      # exactly what the pinned plugin emits — any drift means someone
+      # regenerated with an unpinned tool (see docs/codegen-pinning.md).
+      - name: Regenerate route_guide stubs and diff against checked-in copies
+        run: |
+          out=$(mktemp -d)
+          tools/bin/protoc -I examples/route_guide \
+            --plugin=protoc-gen-grpc=tools/bin/grpc_cpp_plugin \
+            --grpc_out="$out" examples/route_guide/route_guide.proto
+          diff -u "$out/route_guide.grpc.pb.h" examples/route_guide/gen/route_guide.grpc.pb.h
+          diff -u "$out/route_guide.grpc.pb.cc" examples/route_guide/gen/route_guide.grpc.pb.cc
