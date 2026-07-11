@@ -29,6 +29,16 @@ TimePoint Base() { return std::chrono::steady_clock::now(); }
 TimePoint At(TimePoint base, int ms) { return base + std::chrono::milliseconds(ms); }
 TimePoint AtSec(TimePoint base, int s) { return base + std::chrono::seconds(s); }
 
+// The keepalive-schedule tests pin an explicit 60s/20s configuration (the
+// "cellular" profile) so they test the schedule mechanics independently of
+// the shipped server-safe default (300 s, asserted separately below).
+Http2SessionOptions KeepaliveOpts() {
+  Http2SessionOptions o;
+  o.keepalive_time = std::chrono::milliseconds(60000);
+  o.keepalive_timeout = std::chrono::milliseconds(20000);
+  return o;
+}
+
 // RAII wrapper for a raw nghttp2 server session so no test leaks it (ASan runs
 // with detect_leaks=1). A server needs its own SETTINGS submitted after
 // creation for the handshake to complete.
@@ -172,13 +182,13 @@ TEST_CASE("Http2Session: keepalive schedule sends PING and clears on ack") {
   Http2Session::Hooks hooks;
   hooks.on_ping_ack = [&] { ++ping_acks; };
 
-  Http2Session client({}, std::move(hooks), base);
+  Http2Session client(KeepaliveOpts(), std::move(hooks), base);
   REQUIRE(client.ok());
 
   ServerSession server;
   Handshake(client, server.s, base);  // keeps last_read_ == base
 
-  // Defaults: keepalive_time 60s, timeout 20s. Deadline = last_read + 60s.
+  // keepalive_time 60s, timeout 20s. Deadline = last_read + 60s.
   auto nkd = client.NextKeepaliveDeadline(base);
   REQUIRE(nkd.has_value());
   CHECK(*nkd == AtSec(base, 60));
@@ -205,7 +215,7 @@ TEST_CASE("Http2Session: keepalive schedule sends PING and clears on ack") {
 
 TEST_CASE("Http2Session: keepalive death when PING goes unacked") {
   const auto base = Base();
-  Http2Session client({}, {}, base);
+  Http2Session client(KeepaliveOpts(), {}, base);
   REQUIRE(client.ok());
 
   // Send a keepalive PING at base + 60s; do NOT pump the ack.
@@ -218,9 +228,19 @@ TEST_CASE("Http2Session: keepalive death when PING goes unacked") {
   CHECK(client.CheckKeepalive(At(base, 60000 + 20000)) == KeepaliveAction::kDead);
 }
 
+TEST_CASE("Http2Session: default keepalive_time is server-safe (300 s)") {
+  // §5.2: the default must not trip an unmodified upstream server's
+  // too_many_pings enforcement (5-minute minimum ping interval). 60 s is the
+  // opt-in cellular profile, never the default.
+  const Http2SessionOptions defaults;
+  CHECK(defaults.keepalive_time == std::chrono::milliseconds(300000));
+  CHECK(defaults.keepalive_timeout == std::chrono::milliseconds(20000));
+  CHECK(defaults.keepalive_permit_without_calls);
+}
+
 TEST_CASE("Http2Session: any read counts as liveness while PING outstanding") {
   const auto base = Base();
-  Http2Session client({}, {}, base);
+  Http2Session client(KeepaliveOpts(), {}, base);
   REQUIRE(client.ok());
 
   ServerSession server;

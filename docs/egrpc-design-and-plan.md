@@ -205,7 +205,8 @@ Response handling: initial HEADERS must be `:status: 200` with `content-type: ap
 
 Implements gRPC's client keepalive semantics on top of nghttp2 PING:
 
-- `keepalive_time` (default 60 s on cellular-targeted builds; configurable via `GRPC_ARG_KEEPALIVE_TIME_MS` through `ChannelArguments` for shim parity or `egrpc::ChannelConfig` natively): send PING after this long with no reads.
+- `keepalive_time` (default **300 s** — server-safe: matches upstream servers' default `min_ping_interval_without_data`, so an unmodified server never GOAWAYs on first contact; configurable via `GRPC_ARG_KEEPALIVE_TIME_MS` through `ChannelArguments` for shim parity or `egrpc::ChannelConfig` natively): send PING after this long with no reads.
+- **Cellular profile** (opt-in, not default): NAT-mapping keepalive typically wants `keepalive_time = 60 s`. This trips a default upstream server's `too_many_pings` enforcement, so deployments choosing it **must** coordinate server settings (`GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS ≤ 60 s` and `GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS = 1` on the server). M7's `egrpc::ChannelConfig` ships this as a named preset with these requirements in its documentation. Against a non-coordinated server the ENHANCE_YOUR_CALM doubling below makes the client degrade rather than break.
 - `keepalive_timeout` (default 20 s): if no PING ack (or any read) within this window, declare the connection dead → `TRANSIENT_FAILURE`, fail in-flight calls with `UNAVAILABLE`, enter backoff.
 - `keepalive_permit_without_calls` (default **true** for egrpc — deviating deliberately from upstream's default, because the NAT-mapping use case is the whole point; documented).
 - Respect server `GOAWAY` with `ENHANCE_YOUR_CALM`/`too_many_pings` debug data by doubling `keepalive_time` and logging loudly — this is the standard defense against tripping server-side keepalive enforcement.

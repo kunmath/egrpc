@@ -51,7 +51,12 @@ struct Http2SessionOptions {
   // Keepalive (§5.2). keepalive_time: send PING after this long with no
   // reads. keepalive_timeout: declare dead if neither the ack nor any other
   // read arrives within this window after the PING was sent.
-  std::chrono::milliseconds keepalive_time{60000};
+  //
+  // The 300 s default matches an unmodified upstream server's minimum ping
+  // interval without data, so first contact never GOAWAY-churns on
+  // too_many_pings. Cellular/NAT deployments that need 60 s must lower this
+  // explicitly AND coordinate the server's enforcement settings (§5.2).
+  std::chrono::milliseconds keepalive_time{300000};
   std::chrono::milliseconds keepalive_timeout{20000};
   bool keepalive_permit_without_calls = true;
 };
