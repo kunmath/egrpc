@@ -62,15 +62,20 @@ Status Channel::BlockingUnaryCallShim(const internal::RpcMethod& method, ClientC
                                       const std::string& request, std::string* response) {
   if (!impl_) return lame_status_;
 
-  // Deadline → grpc-timeout (§5.1). Already-expired deadlines fail before
-  // anything is sent, matching upstream's fail-fast.
-  std::optional<std::chrono::nanoseconds> timeout;
+  // Deadline: already-expired deadlines fail before anything is queued,
+  // matching upstream's fail-fast. Otherwise the context's wall-clock
+  // deadline converts to an absolute steady-clock deadline here; the
+  // grpc-timeout header (§5.1) is computed from it on the EventThread when
+  // the HEADERS are built, so time spent queued (e.g. during connect) is
+  // not re-promised to the server.
+  std::optional<std::chrono::steady_clock::time_point> deadline;
   if (context->deadline_ != std::chrono::system_clock::time_point::max()) {
     const auto now = std::chrono::system_clock::now();
     if (context->deadline_ <= now) {
       return Status(StatusCode::DEADLINE_EXCEEDED, "Deadline Exceeded");
     }
-    timeout = std::chrono::duration_cast<std::chrono::nanoseconds>(context->deadline_ - now);
+    deadline = std::chrono::steady_clock::now() +
+               std::chrono::duration_cast<std::chrono::nanoseconds>(context->deadline_ - now);
   }
 
   egrpc::internal::Http2Session::HeaderList metadata;
@@ -80,7 +85,7 @@ Status Channel::BlockingUnaryCallShim(const internal::RpcMethod& method, ClientC
   }
 
   egrpc::internal::CallState::Result result =
-      impl_->UnaryCall(method.name(), request, std::move(metadata), timeout);
+      impl_->UnaryCall(method.name(), request, std::move(metadata), deadline);
 
   DepositMetadata(result.initial_metadata, &context->recv_initial_metadata_,
                   &context->recv_initial_view_);

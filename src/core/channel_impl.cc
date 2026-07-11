@@ -30,9 +30,9 @@ ChannelImpl::ChannelImpl(std::string host, uint16_t port, TlsConfig tls, Channel
 
 ChannelImpl::~ChannelImpl() { Shutdown(); }
 
-CallState::Result ChannelImpl::UnaryCall(const std::string& method_path, std::string request,
-                                         Http2Session::HeaderList metadata,
-                                         std::optional<std::chrono::nanoseconds> timeout) {
+CallState::Result ChannelImpl::UnaryCall(
+    const std::string& method_path, std::string request, Http2Session::HeaderList metadata,
+    std::optional<std::chrono::steady_clock::time_point> deadline) {
   // Send-path bound (§4.5): checked before anything is queued, so the
   // caller gets kResourceExhausted without a wire exchange, like upstream.
   if (request.size() > options_.max_send_message_size) {
@@ -53,7 +53,7 @@ CallState::Result ChannelImpl::UnaryCall(const std::string& method_path, std::st
   AppendGrpcFramePrefix(request.size(), &pc->framed_body);
   pc->framed_body += request;
   pc->metadata = std::move(metadata);
-  pc->timeout = timeout;
+  pc->deadline = deadline;
 
   if (!loop_ok_ || !loop_.Post([this, pc] { HandleNewCall(std::move(*pc)); })) {
     // Off-event-thread FailLocal is safe only here: the op never reached the
@@ -180,8 +180,22 @@ void ChannelImpl::SubmitCall(PendingCall pc) {
     return;
   }
 
+  // grpc-timeout is computed here, not at call entry: a call that queued
+  // while the channel was connecting must tell the server the time it has
+  // *left*, not the time it started with. An expired deadline fails locally
+  // without touching the wire, matching upstream's fail-fast.
+  std::optional<std::chrono::nanoseconds> timeout;
+  if (pc.deadline.has_value()) {
+    const auto now = std::chrono::steady_clock::now();
+    if (*pc.deadline <= now) {
+      pc.call->FailLocal(StatusCode::kDeadlineExceeded, "Deadline Exceeded");
+      return;
+    }
+    timeout = std::chrono::duration_cast<std::chrono::nanoseconds>(*pc.deadline - now);
+  }
+
   const Http2Session::HeaderList headers = BuildRequestHeaders(
-      authority_, pc.method_path, pc.timeout, pc.metadata, options_.user_agent_prefix);
+      authority_, pc.method_path, timeout, pc.metadata, options_.user_agent_prefix);
 
   Http2Session::StreamHooks hooks = CallState::MakeStreamHooks(pc.call);
   // Wrap on_close to also drop the channel's reference to the call.

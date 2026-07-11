@@ -58,12 +58,16 @@ class ChannelImpl {
   // Blocking unary call, safe from any thread. `request` is the serialized
   // request message (protobuf-lite bytes; framing is added here). `metadata`
   // is the caller's initial metadata, raw: keys are lowercased and `-bin`
-  // values base64-encoded on the way to the wire (§5.1). `timeout` becomes
-  // the grpc-timeout header when set (local deadline timers land in M5).
-  // Returns the full result: status, response bytes, metadata.
-  CallState::Result UnaryCall(const std::string& method_path, std::string request,
-                              Http2Session::HeaderList metadata = {},
-                              std::optional<std::chrono::nanoseconds> timeout = std::nullopt);
+  // values base64-encoded on the way to the wire (§5.1). `deadline` is
+  // absolute (steady clock): the grpc-timeout header is computed from it
+  // when the HEADERS are actually built on the EventThread, so time spent
+  // queued (e.g. during connect) is not re-promised to the server; a call
+  // whose deadline has passed by then fails with kDeadlineExceeded without
+  // being submitted (local deadline timers land in M5). Returns the full
+  // result: status, response bytes, metadata.
+  CallState::Result UnaryCall(
+      const std::string& method_path, std::string request, Http2Session::HeaderList metadata = {},
+      std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt);
 
   // Design §5.7 (M3 subset): refuse new calls with kUnavailable, fail
   // in-flight calls, terminate the HTTP/2 session gracefully with a
@@ -81,7 +85,7 @@ class ChannelImpl {
     std::string method_path;
     std::string framed_body;
     Http2Session::HeaderList metadata;
-    std::optional<std::chrono::nanoseconds> timeout;
+    std::optional<std::chrono::steady_clock::time_point> deadline;
   };
 
   // --- Event-thread only ----------------------------------------------------

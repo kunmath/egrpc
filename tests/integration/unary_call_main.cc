@@ -41,7 +41,7 @@ int main(int argc, char** argv) {
   std::string path = "/routeguide.RouteGuide/GetFeature";
   int32_t latitude = 0;
   int32_t longitude = 0;
-  std::optional<std::chrono::nanoseconds> timeout;
+  std::optional<std::chrono::milliseconds> timeout;
   int calls = 1;
 
   for (int i = 1; i < argc; ++i) {
@@ -88,7 +88,12 @@ int main(int argc, char** argv) {
       return 1;
     }
 
-    const egrpc::internal::CallState::Result result = channel.UnaryCall(path, request, {}, timeout);
+    // UnaryCall takes an absolute steady-clock deadline; the per-call
+    // --timeout-ms is relative to each call's start.
+    std::optional<std::chrono::steady_clock::time_point> deadline;
+    if (timeout.has_value()) deadline = std::chrono::steady_clock::now() + *timeout;
+    const egrpc::internal::CallState::Result result =
+        channel.UnaryCall(path, request, {}, deadline);
 
     std::printf("STATUS code=%d message=%s\n", static_cast<int>(result.code),
                 result.message.c_str());
