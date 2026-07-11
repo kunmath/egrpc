@@ -14,7 +14,10 @@
 #include <grpcpp/support/sync_stream.h>
 
 namespace grpc {
+namespace internal {
 
+// The shared async-streaming interfaces live in grpc::internal, exactly as
+// in upstream v1.82 — user code names them qualified.
 class ClientAsyncStreamingInterface {
  public:
   virtual ~ClientAsyncStreamingInterface() = default;
@@ -36,10 +39,9 @@ class AsyncWriterInterface {
   virtual ~AsyncWriterInterface() = default;
   virtual void Write(const W& msg, void* tag) = 0;
   virtual void Write(const W& msg, WriteOptions options, void* tag) = 0;
+  virtual void WriteLast(const W& msg, WriteOptions options, void* tag) = 0;
   virtual void WritesDone(void* tag) = 0;
 };
-
-namespace internal {
 
 // Shared behavior of the concrete client async stubs below.
 class AsyncClientStubBase {
@@ -65,8 +67,8 @@ class AsyncClientStubBase {
 }  // namespace internal
 
 template <class R>
-class ClientAsyncReaderInterface : public ClientAsyncStreamingInterface,
-                                   public AsyncReaderInterface<R> {};
+class ClientAsyncReaderInterface : public internal::ClientAsyncStreamingInterface,
+                                   public internal::AsyncReaderInterface<R> {};
 
 namespace internal {
 template <class R>
@@ -92,8 +94,8 @@ class ClientAsyncReader final : public ClientAsyncReaderInterface<R>,
 };
 
 template <class W>
-class ClientAsyncWriterInterface : public ClientAsyncStreamingInterface,
-                                   public AsyncWriterInterface<W> {};
+class ClientAsyncWriterInterface : public internal::ClientAsyncStreamingInterface,
+                                   public internal::AsyncWriterInterface<W> {};
 
 namespace internal {
 template <class W>
@@ -115,6 +117,11 @@ class ClientAsyncWriter final : public ClientAsyncWriterInterface<W>,
     (void)options;
     this->EnqueueFailedOp(tag);
   }
+  void WriteLast(const W& msg, WriteOptions options, void* tag) override {
+    (void)msg;
+    (void)options;
+    this->EnqueueFailedOp(tag);
+  }
   void WritesDone(void* tag) override { this->EnqueueFailedOp(tag); }
   void Finish(Status* status, void* tag) override { this->EnqueueFinish(status, tag); }
 
@@ -125,9 +132,9 @@ class ClientAsyncWriter final : public ClientAsyncWriterInterface<W>,
 };
 
 template <class W, class R>
-class ClientAsyncReaderWriterInterface : public ClientAsyncStreamingInterface,
-                                         public AsyncWriterInterface<W>,
-                                         public AsyncReaderInterface<R> {};
+class ClientAsyncReaderWriterInterface : public internal::ClientAsyncStreamingInterface,
+                                         public internal::AsyncWriterInterface<W>,
+                                         public internal::AsyncReaderInterface<R> {};
 
 namespace internal {
 template <class W, class R>
@@ -149,6 +156,11 @@ class ClientAsyncReaderWriter final : public ClientAsyncReaderWriterInterface<W,
     this->EnqueueFailedOp(tag);
   }
   void Write(const W& msg, WriteOptions options, void* tag) override {
+    (void)msg;
+    (void)options;
+    this->EnqueueFailedOp(tag);
+  }
+  void WriteLast(const W& msg, WriteOptions options, void* tag) override {
     (void)msg;
     (void)options;
     this->EnqueueFailedOp(tag);

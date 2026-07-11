@@ -4,8 +4,11 @@
 # uncached, cached across runs on pin-codegen.sh's hash), so this workflow
 # triggers only when something that could invalidate the stubs changes —
 # which is exactly when the check is load-bearing — plus manual dispatch.
-# The path filter is the enforcement boundary: a PR touching gen/ or the
-# proto or the pin script CANNOT merge green without passing this.
+#
+# NOTE: a workflow can only report; merge ENFORCEMENT needs repository
+# configuration. To make this binding, add a branch protection rule /
+# ruleset on main requiring the "codegen-tools" check when it is triggered
+# (Settings → Rules). Until then a red run here can still be merged.
 name: codegen
 
 on:

@@ -6,14 +6,20 @@
 // The stubs are type-agnostic (no serialization happens), so std::string
 // stands in for message types.
 
+#include <chrono>
+#include <cstddef>
 #include <memory>
 #include <string>
+#include <thread>
+#include <utility>
+#include <vector>
 
 #include "doctest/doctest.h"
 #include "grpcpp/completion_queue.h"
 #include "grpcpp/support/async_stream.h"
 #include "grpcpp/support/async_unary_call.h"
 #include "grpcpp/support/client_callback.h"
+#include "grpcpp/support/string_ref.h"
 
 namespace {
 
@@ -68,12 +74,42 @@ TEST_SUITE("shim_stubs") {
     CHECK(status.error_code() == grpc::StatusCode::UNIMPLEMENTED);
   }
 
-  TEST_CASE("a drained CompletionQueue reports shutdown, not a hang") {
+  TEST_CASE("CQ reports shutdown only after Shutdown(); live-but-empty is TIMEOUT") {
     grpc::CompletionQueue cq;
     void* tag = nullptr;
     bool ok = false;
-    CHECK_FALSE(cq.Next(&tag, &ok));
+    CHECK(cq.AsyncNext(&tag, &ok, 0) == grpc::CompletionQueue::TIMEOUT);
+    cq.Shutdown();
     CHECK(cq.AsyncNext(&tag, &ok, 0) == grpc::CompletionQueue::SHUTDOWN);
+    CHECK_FALSE(cq.Next(&tag, &ok));
+  }
+
+  TEST_CASE("Next blocks across a producer/consumer race instead of false shutdown") {
+    grpc::CompletionQueue cq;
+    int finish_tag = 0;
+    std::vector<std::pair<void*, bool>> received;
+
+    // Consumer first: it must WAIT, not report shutdown, until the
+    // producer's Finish lands and then until Shutdown drains it out.
+    std::thread consumer([&] {
+      void* tag = nullptr;
+      bool ok = false;
+      while (cq.Next(&tag, &ok)) received.emplace_back(tag, ok);
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    std::unique_ptr<grpc::ClientAsyncResponseReader<std::string>> reader(
+        grpc::internal::ClientAsyncResponseReaderHelper::Create<std::string, std::string>(
+            nullptr, &cq, kMethod, nullptr, "request"));
+    std::string response;
+    grpc::Status status;
+    reader->Finish(&response, &status, &finish_tag);
+    cq.Shutdown();
+    consumer.join();
+
+    REQUIRE(received.size() == 1);
+    CHECK(received[0].first == &finish_tag);
+    CHECK(received[0].second);
   }
 
   TEST_CASE("reactor StartCall delivers OnDone(UNIMPLEMENTED) synchronously") {
@@ -95,5 +131,39 @@ TEST_SUITE("shim_stubs") {
     struct MinimalReactor final : grpc::ClientReadReactor<std::string> {
     } reactor;
     reactor.StartCall();  // must not crash with the default OnDone
+  }
+
+  TEST_CASE("reactor OnDone waits for hold removal and fires exactly once") {
+    struct Reactor final : grpc::ClientReadReactor<std::string> {
+      std::vector<std::string> events;
+      void OnReadDone(bool ok) override { events.push_back(ok ? "read-ok" : "read-fail"); }
+      void OnDone(const grpc::Status& s) override {
+        CHECK(s.error_code() == grpc::StatusCode::UNIMPLEMENTED);
+        events.push_back("done");
+      }
+    } reactor;
+
+    reactor.AddHold();
+    reactor.StartCall();
+    CHECK(reactor.events.empty());  // held: no OnDone yet
+
+    std::string msg;
+    reactor.StartRead(&msg);  // completes unsuccessfully, before OnDone
+    reactor.RemoveHold();
+
+    REQUIRE(reactor.events.size() == 2);
+    CHECK(reactor.events[0] == "read-fail");
+    CHECK(reactor.events[1] == "done");
+  }
+
+  TEST_CASE("string_ref substr clamps huge lengths instead of overflowing") {
+    const std::string storage = "hello world";
+    grpc::string_ref ref(storage);
+    CHECK(ref.substr(2, static_cast<size_t>(-2)).size() == storage.size() - 2);
+    CHECK(ref.substr(2) == grpc::string_ref("llo world"));
+    CHECK(ref.substr(200).empty());
+    CHECK(ref.max_size() == storage.size());  // upstream v1.82 parity
+    CHECK(ref.starts_with("hello"));
+    CHECK(ref.find('w') == 6);
   }
 }

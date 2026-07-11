@@ -22,7 +22,7 @@ class string_ref {
   const char* data() const { return data_; }
   size_t size() const { return length_; }
   size_t length() const { return length_; }
-  size_t max_size() const { return npos - 1; }
+  size_t max_size() const { return length_; }  // upstream v1.82 quirk, kept for parity
   bool empty() const { return length_ == 0; }
 
   const char* begin() const { return data_; }
@@ -36,7 +36,9 @@ class string_ref {
 
   string_ref substr(size_t pos, size_t n = npos) const {
     if (pos > length_) return string_ref("", static_cast<size_t>(0));
-    if (n == npos || pos + n > length_) n = length_ - pos;
+    // Compare against the remaining length instead of computing pos + n,
+    // which can overflow for huge n.
+    if (n > length_ - pos) n = length_ - pos;
     return string_ref(data_ + pos, n);
   }
 

@@ -125,7 +125,8 @@ class RouteGuideClient {
 
   // TSan fodder: hammer the channel from `threads` caller threads at once
   // (design §3: callers only touch the op queue + per-call condvar).
-  void ConcurrentGetFeature(int threads, int32_t latitude, int32_t longitude, int deadline_ms) {
+  // Returns true only when every call succeeded.
+  bool ConcurrentGetFeature(int threads, int32_t latitude, int32_t longitude, int deadline_ms) {
     std::atomic<int> ok{0};
     std::vector<std::thread> workers;
     workers.reserve(static_cast<size_t>(threads));
@@ -138,6 +139,7 @@ class RouteGuideClient {
     }
     for (auto& w : workers) w.join();
     std::printf("CONCURRENT ok=%d total=%d\n", ok.load(), threads);
+    return ok.load() == threads;
   }
 
  private:
@@ -208,8 +210,7 @@ int main(int argc, char** argv) {
     return 0;
   }
   if (mode == "concurrent") {
-    client.ConcurrentGetFeature(threads, latitude, longitude, deadline_ms);
-    return 0;
+    return client.ConcurrentGetFeature(threads, latitude, longitude, deadline_ms) ? 0 : 1;
   }
   std::fprintf(stderr, "unknown mode: %s\n", mode.c_str());
   return 2;
