@@ -46,9 +46,10 @@ return `UNIMPLEMENTED` at runtime.
 - Response: initial HEADERS `:status: 200` + `content-type: application/grpc*`,
   then DATA, then trailers with `grpc-status` (int) and optional `grpc-message`
   (percent-encoded UTF-8). **Trailers-only** responses (HEADERS with END_STREAM
-  carrying `grpc-status`, no DATA) are valid and must be handled. Missing
-  `grpc-status` at stream end → `INTERNAL`. When trailers carry `grpc-status` it
-  wins over HTTP-status mapping (table in design §5.5).
+  carrying `grpc-status`, no DATA) are valid and must be handled. Missing or
+  malformed `grpc-status` at a clean stream end → `UNKNOWN` (HTTP-status
+  fallback; 200 → UNKNOWN). When trailers carry `grpc-status` it wins over
+  HTTP-status mapping (table in design §5.5).
 
 ## Pinned codegen tools (design §4.5)
 

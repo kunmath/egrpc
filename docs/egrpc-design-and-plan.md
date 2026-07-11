@@ -199,7 +199,7 @@ Request HEADERS: `:method: POST`, `:scheme: https`, `:authority: <host[:port]>`,
 
 Each message on the wire: `[1-byte compressed flag = 0][4-byte big-endian length][payload]`. We send `grpc-encoding: identity` semantics implicitly and set `grpc-accept-encoding: identity`; a server responding with compressed messages (flag=1) fails the call with `INTERNAL` ("compression not supported") — servers won't compress unless the client advertises support, so this is a defensive check.
 
-Response handling: initial HEADERS must be `:status: 200` with `content-type: application/grpc*`; then DATA; then trailers with `grpc-status` (int) and optional `grpc-message` (percent-encoded UTF-8). Trailers-only responses handled per §4.3. Missing `grpc-status` at stream end → `INTERNAL` per spec.
+Response handling: initial HEADERS must be `:status: 200` with `content-type: application/grpc*`; then DATA; then trailers with `grpc-status` (int) and optional `grpc-message` (percent-encoded UTF-8). Trailers-only responses handled per §4.3. Missing `grpc-status` at a clean stream end falls back to the HTTP-status mapping (§5.5), so a 200 without `grpc-status` → `UNKNOWN`, matching upstream; a malformed `grpc-status` value likewise maps to `UNKNOWN`.
 
 ### 5.2 Keepalive
 
@@ -231,10 +231,14 @@ When trailers carry `grpc-status`, it wins. Otherwise map per the gRPC HTTP/2 sp
 | 429 / 502 / 503 / 504 | UNAVAILABLE |
 | RST_STREAM REFUSED_STREAM | UNAVAILABLE (safe to transparently retry — noted for future) |
 | RST_STREAM CANCEL | CANCELLED |
+| RST_STREAM ENHANCE_YOUR_CALM | RESOURCE_EXHAUSTED |
+| RST_STREAM INADEQUATE_SECURITY | PERMISSION_DENIED |
+| RST_STREAM other codes | INTERNAL (matches upstream `grpc_http2_error_to_grpc_status`) |
 | Connection lost / GOAWAY mid-call | UNAVAILABLE |
 | Local deadline expiry | DEADLINE_EXCEEDED (and send RST_STREAM CANCEL) |
 | `TryCancel()` | CANCELLED |
-| Malformed frame / missing grpc-status | INTERNAL |
+| Malformed gRPC frame (bad flag, oversize, truncated) | INTERNAL |
+| Missing grpc-status on clean 200 close, or malformed grpc-status value | UNKNOWN (upstream falls back to HTTP-status mapping; 200 → UNKNOWN) |
 
 ### 5.6 Deadlines & cancellation
 
