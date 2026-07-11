@@ -1,7 +1,9 @@
 // egrpc grpcpp shim — async streaming types (design §4.5): compile-present
-// only, like async unary. Async completion-queue calls are permanently out
-// of scope (design §2); started operations never complete because the
-// CompletionQueue behaves as shut down, which async drain loops handle.
+// only, like async unary. Operations perform no I/O; every tagged op
+// delivers its tag through the bound CompletionQueue — Finish with ok=true
+// after depositing an UNIMPLEMENTED status (upstream: client-side Finish is
+// always ok), everything else with ok=false (upstream's failed-operation
+// signal) — so async drain loops observe completion and terminate.
 #pragma once
 
 #include <grpcpp/client_context.h>
@@ -39,16 +41,25 @@ class AsyncWriterInterface {
 
 namespace internal {
 
-// Shared no-op behavior for the concrete client async stubs below: every
-// operation is accepted and dropped; Finish reports UNIMPLEMENTED into
-// *status for anyone who inspects it without waiting on the (dead) queue.
-class AsyncStubOps {
- public:
-  static void FillUnimplemented(Status* status) {
+// Shared behavior of the concrete client async stubs below.
+class AsyncClientStubBase {
+ protected:
+  explicit AsyncClientStubBase(grpc::CompletionQueue* cq) : cq_(cq) {}
+
+  // Any op that would have needed the wire: tag back with ok=false.
+  void EnqueueFailedOp(void* tag) {
+    if (cq_ != nullptr) cq_->EgrpcEnqueueTag(tag, false);
+  }
+  // Client-side Finish: deposit UNIMPLEMENTED, tag back with ok=true.
+  void EnqueueFinish(Status* status, void* tag) {
     if (status != nullptr) {
       *status = Status(StatusCode::UNIMPLEMENTED, "async API not supported by egrpc");
     }
+    if (cq_ != nullptr) cq_->EgrpcEnqueueTag(tag, true);
   }
+
+ private:
+  grpc::CompletionQueue* const cq_;
 };
 
 }  // namespace internal
@@ -63,23 +74,21 @@ class ClientAsyncReaderFactory;
 }  // namespace internal
 
 template <class R>
-class ClientAsyncReader final : public ClientAsyncReaderInterface<R> {
+class ClientAsyncReader final : public ClientAsyncReaderInterface<R>,
+                                private internal::AsyncClientStubBase {
  public:
-  void StartCall(void* tag) override { (void)tag; }
-  void ReadInitialMetadata(void* tag) override { (void)tag; }
+  void StartCall(void* tag) override { this->EnqueueFailedOp(tag); }
+  void ReadInitialMetadata(void* tag) override { this->EnqueueFailedOp(tag); }
   void Read(R* msg, void* tag) override {
     (void)msg;
-    (void)tag;
+    this->EnqueueFailedOp(tag);
   }
-  void Finish(Status* status, void* tag) override {
-    (void)tag;
-    internal::AsyncStubOps::FillUnimplemented(status);
-  }
+  void Finish(Status* status, void* tag) override { this->EnqueueFinish(status, tag); }
 
  private:
   template <class>
   friend class internal::ClientAsyncReaderFactory;
-  ClientAsyncReader() = default;
+  explicit ClientAsyncReader(grpc::CompletionQueue* cq) : AsyncClientStubBase(cq) {}
 };
 
 template <class W>
@@ -92,29 +101,27 @@ class ClientAsyncWriterFactory;
 }  // namespace internal
 
 template <class W>
-class ClientAsyncWriter final : public ClientAsyncWriterInterface<W> {
+class ClientAsyncWriter final : public ClientAsyncWriterInterface<W>,
+                                private internal::AsyncClientStubBase {
  public:
-  void StartCall(void* tag) override { (void)tag; }
-  void ReadInitialMetadata(void* tag) override { (void)tag; }
+  void StartCall(void* tag) override { this->EnqueueFailedOp(tag); }
+  void ReadInitialMetadata(void* tag) override { this->EnqueueFailedOp(tag); }
   void Write(const W& msg, void* tag) override {
     (void)msg;
-    (void)tag;
+    this->EnqueueFailedOp(tag);
   }
   void Write(const W& msg, WriteOptions options, void* tag) override {
     (void)msg;
     (void)options;
-    (void)tag;
+    this->EnqueueFailedOp(tag);
   }
-  void WritesDone(void* tag) override { (void)tag; }
-  void Finish(Status* status, void* tag) override {
-    (void)tag;
-    internal::AsyncStubOps::FillUnimplemented(status);
-  }
+  void WritesDone(void* tag) override { this->EnqueueFailedOp(tag); }
+  void Finish(Status* status, void* tag) override { this->EnqueueFinish(status, tag); }
 
  private:
   template <class>
   friend class internal::ClientAsyncWriterFactory;
-  ClientAsyncWriter() = default;
+  explicit ClientAsyncWriter(grpc::CompletionQueue* cq) : AsyncClientStubBase(cq) {}
 };
 
 template <class W, class R>
@@ -128,33 +135,31 @@ class ClientAsyncReaderWriterFactory;
 }  // namespace internal
 
 template <class W, class R>
-class ClientAsyncReaderWriter final : public ClientAsyncReaderWriterInterface<W, R> {
+class ClientAsyncReaderWriter final : public ClientAsyncReaderWriterInterface<W, R>,
+                                      private internal::AsyncClientStubBase {
  public:
-  void StartCall(void* tag) override { (void)tag; }
-  void ReadInitialMetadata(void* tag) override { (void)tag; }
+  void StartCall(void* tag) override { this->EnqueueFailedOp(tag); }
+  void ReadInitialMetadata(void* tag) override { this->EnqueueFailedOp(tag); }
   void Read(R* msg, void* tag) override {
     (void)msg;
-    (void)tag;
+    this->EnqueueFailedOp(tag);
   }
   void Write(const W& msg, void* tag) override {
     (void)msg;
-    (void)tag;
+    this->EnqueueFailedOp(tag);
   }
   void Write(const W& msg, WriteOptions options, void* tag) override {
     (void)msg;
     (void)options;
-    (void)tag;
+    this->EnqueueFailedOp(tag);
   }
-  void WritesDone(void* tag) override { (void)tag; }
-  void Finish(Status* status, void* tag) override {
-    (void)tag;
-    internal::AsyncStubOps::FillUnimplemented(status);
-  }
+  void WritesDone(void* tag) override { this->EnqueueFailedOp(tag); }
+  void Finish(Status* status, void* tag) override { this->EnqueueFinish(status, tag); }
 
  private:
   template <class, class>
   friend class internal::ClientAsyncReaderWriterFactory;
-  ClientAsyncReaderWriter() = default;
+  explicit ClientAsyncReaderWriter(grpc::CompletionQueue* cq) : AsyncClientStubBase(cq) {}
 };
 
 namespace internal {
@@ -167,13 +172,12 @@ class ClientAsyncReaderFactory {
                                       const RpcMethod& method, grpc::ClientContext* context,
                                       const W& request, bool start, void* tag) {
     (void)channel;
-    (void)cq;
     (void)method;
     (void)context;
     (void)request;
-    (void)start;
-    (void)tag;
-    return new ClientAsyncReader<R>();
+    auto* reader = new ClientAsyncReader<R>(cq);
+    if (start) reader->StartCall(tag);
+    return reader;
   }
 };
 
@@ -185,13 +189,12 @@ class ClientAsyncWriterFactory {
                                       const RpcMethod& method, grpc::ClientContext* context,
                                       R* response, bool start, void* tag) {
     (void)channel;
-    (void)cq;
     (void)method;
     (void)context;
     (void)response;
-    (void)start;
-    (void)tag;
-    return new ClientAsyncWriter<W>();
+    auto* writer = new ClientAsyncWriter<W>(cq);
+    if (start) writer->StartCall(tag);
+    return writer;
   }
 };
 
@@ -203,12 +206,11 @@ class ClientAsyncReaderWriterFactory {
                                                grpc::ClientContext* context, bool start,
                                                void* tag) {
     (void)channel;
-    (void)cq;
     (void)method;
     (void)context;
-    (void)start;
-    (void)tag;
-    return new ClientAsyncReaderWriter<W, R>();
+    auto* stream = new ClientAsyncReaderWriter<W, R>(cq);
+    if (start) stream->StartCall(tag);
+    return stream;
   }
 };
 

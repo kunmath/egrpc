@@ -23,6 +23,9 @@ class Status {
 
   bool ok() const { return code_ == StatusCode::OK; }
 
+  // Upstream parity: explicit "I checked and don't care" marker.
+  void IgnoreError() const {}
+
   // Upstream compatibility: pre-defined convenience instances.
   static const Status& OK;
   static const Status& CANCELLED;

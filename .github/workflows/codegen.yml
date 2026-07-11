@@ -1,0 +1,54 @@
+# Pinned-codegen verification (design §4.5, §8/M4): rebuild the pinned
+# protoc + grpc_cpp_plugin and diff the checked-in generated stubs against
+# their output. Building the plugin from source is expensive (~6+ min
+# uncached, cached across runs on pin-codegen.sh's hash), so this workflow
+# triggers only when something that could invalidate the stubs changes —
+# which is exactly when the check is load-bearing — plus manual dispatch.
+# The path filter is the enforcement boundary: a PR touching gen/ or the
+# proto or the pin script CANNOT merge green without passing this.
+name: codegen
+
+on:
+  push:
+    paths:
+      - "examples/route_guide/route_guide.proto"
+      - "examples/route_guide/gen/**"
+      - "tools/pin-codegen.sh"
+      - ".github/workflows/codegen.yml"
+  pull_request:
+    paths:
+      - "examples/route_guide/route_guide.proto"
+      - "examples/route_guide/gen/**"
+      - "tools/pin-codegen.sh"
+      - ".github/workflows/codegen.yml"
+  workflow_dispatch:
+
+jobs:
+  codegen-tools:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache pinned codegen tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            tools/bin
+            tools/include
+            tools/.pin-codegen-work
+          key: pin-codegen-${{ hashFiles('tools/pin-codegen.sh') }}
+      - name: Build pinned codegen tools
+        run: tools/pin-codegen.sh
+      - name: Verify protoc
+        run: tools/bin/protoc --version
+      # M4 acceptance (design §8): the checked-in .grpc.pb.* stubs must be
+      # exactly what the pinned plugin emits — any drift means someone
+      # regenerated with an unpinned tool (see docs/codegen-pinning.md).
+      - name: Regenerate route_guide stubs and diff against checked-in copies
+        run: |
+          out=$(mktemp -d)
+          tools/bin/protoc -I examples/route_guide \
+            --plugin=protoc-gen-grpc=tools/bin/grpc_cpp_plugin \
+            --grpc_out="$out" examples/route_guide/route_guide.proto
+          diff -u "$out/route_guide.grpc.pb.h" examples/route_guide/gen/route_guide.grpc.pb.h
+          diff -u "$out/route_guide.grpc.pb.cc" examples/route_guide/gen/route_guide.grpc.pb.cc

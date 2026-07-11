@@ -101,6 +101,19 @@ class RouteGuideTestServer:
                 if lat == -3:
                     return pb2.Feature(name="x" * 200000, location=request)
 
+                # Deadline echo: report whether the client's grpc-timeout
+                # header reached the server, and roughly how much remained.
+                # Lets tests assert timeout propagation end-to-end.
+                if lat == -4:
+                    remaining = context.time_remaining()
+                    # grpcio reports "no deadline" as None or as a huge
+                    # sentinel (int64-max-ish seconds), depending on version.
+                    if remaining is None or remaining > 10**6:
+                        name = "tr-none"
+                    else:
+                        name = "tr-{}".format(int(round(remaining)))
+                    return pb2.Feature(name=name, location=request)
+
                 # Known point: send initial metadata first, then the feature.
                 if lat == 1000 and lon == 2000:
                     context.send_initial_metadata((("egrpc-initial", "iv1"),))

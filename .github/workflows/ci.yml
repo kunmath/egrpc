@@ -58,7 +58,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libnghttp2-dev libssl-dev libprotobuf-dev pkg-config
+          sudo apt-get install -y libnghttp2-dev libssl-dev libprotobuf-dev pkg-config python3-venv
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DEGRPC_SANITIZE=thread
       - name: Build
@@ -67,6 +67,16 @@ jobs:
         env:
           TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
         run: ctest --test-dir build --output-on-failure
+      # The full harness under TSan too: real caller-thread⇄EventThread
+      # interleavings (incl. the M4 shim's concurrent generated-stub calls)
+      # only happen end-to-end, not in the unit suite.
+      - name: Integration harness (TSan probes)
+        env:
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install pytest h2 grpcio grpcio-tools
+          .venv/bin/pytest tests -v
 
   # Ring-3 style integration: pytest harness drives the built probe binary
   # against Python TLS servers (M1 acceptance: ALPN h2 / clean failures).
@@ -106,36 +116,3 @@ jobs:
             exit 0
           fi
           echo "$files" | xargs clang-format-18 --dry-run --Werror
-
-  # Builds the pinned toolchain from source (~6+ min uncached), so to save
-  # runner minutes it only runs when manually dispatched from the Actions tab.
-  # Re-enable per-push (drop the `if`) once minutes are not a concern.
-  codegen-tools:
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-      - name: Cache pinned codegen tools
-        uses: actions/cache@v4
-        with:
-          path: |
-            tools/bin
-            tools/include
-            tools/.pin-codegen-work
-          key: pin-codegen-${{ hashFiles('tools/pin-codegen.sh') }}
-      - name: Build pinned codegen tools
-        run: tools/pin-codegen.sh
-      - name: Verify protoc
-        run: tools/bin/protoc --version
-      # M4 acceptance (design §8): the checked-in .grpc.pb.* stubs must be
-      # exactly what the pinned plugin emits — any drift means someone
-      # regenerated with an unpinned tool (see docs/codegen-pinning.md).
-      - name: Regenerate route_guide stubs and diff against checked-in copies
-        run: |
-          out=$(mktemp -d)
-          tools/bin/protoc -I examples/route_guide \
-            --plugin=protoc-gen-grpc=tools/bin/grpc_cpp_plugin \
-            --grpc_out="$out" examples/route_guide/route_guide.proto
-          diff -u "$out/route_guide.grpc.pb.h" examples/route_guide/gen/route_guide.grpc.pb.h
-          diff -u "$out/route_guide.grpc.pb.cc" examples/route_guide/gen/route_guide.grpc.pb.cc

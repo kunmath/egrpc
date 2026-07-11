@@ -18,6 +18,8 @@ import subprocess
 
 import pytest
 
+from conftest import require_test_binary
+
 from server.route_guide_server import RouteGuideTestServer
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -33,12 +35,10 @@ def unary_bin():
         _REPO_ROOT, "build"
     )
     path = os.path.join(build_dir, "tests", "integration", "egrpc_unary_call")
-    if not os.path.isfile(path):
-        pytest.skip(
-            "probe binary not found at {}; build the project first: "
-            "cmake -S . -B build && cmake --build build -j".format(path),
-            allow_module_level=True,
-        )
+    require_test_binary(
+        path,
+        "build the project first: cmake -S . -B build && cmake --build build -j",
+    )
     return path
 
 

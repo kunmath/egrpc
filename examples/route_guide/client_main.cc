@@ -7,15 +7,20 @@
 // channels).
 //
 // Usage: egrpc_route_guide_client --target host:port --ca-file cert.pem
+//                                 [--mode getfeature|listfeatures|concurrent]
 //                                 [--latitude N] [--longitude N]
-//                                 [--deadline-ms N]
+//                                 [--deadline-ms N] [--threads N]
 //
 // Output (machine-checked by tests/test_shim_unary.py):
 //   GETFEATURE ok name=<name> latitude=<lat> longitude=<lon>
 //   GETFEATURE error code=<int> message=<grpc-message>
+//   INITIAL <key>=<value>   TRAILING <key>=<value>   (escaped, sorted)
+//   LISTFEATURES code=<int> messages=<n>
+//   CONCURRENT ok=<n> total=<n>
 
 #include <grpcpp/grpcpp.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -24,6 +29,8 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "route_guide.grpc.pb.h"
 
@@ -32,9 +39,34 @@ using grpc::ClientContext;
 using grpc::Status;
 using routeguide::Feature;
 using routeguide::Point;
+using routeguide::Rectangle;
 using routeguide::RouteGuide;
 
 namespace {
+
+// Metadata values may be binary (-bin keys are exposed base64-decoded), so
+// non-printable bytes are \xNN-escaped for line-oriented output.
+std::string Escape(grpc::string_ref value) {
+  std::string out;
+  for (char c : value) {
+    const auto u = static_cast<unsigned char>(c);
+    if (u >= 0x20 && u < 0x7f && c != '\\') {
+      out += c;
+    } else {
+      char buf[5];
+      std::snprintf(buf, sizeof(buf), "\\x%02x", u);
+      out += buf;
+    }
+  }
+  return out;
+}
+
+void PrintMetadata(const char* label,
+                   const std::multimap<grpc::string_ref, grpc::string_ref>& metadata) {
+  for (const auto& kv : metadata) {
+    std::printf("%s %s=%s\n", label, Escape(kv.first).c_str(), Escape(kv.second).c_str());
+  }
+}
 
 class RouteGuideClient {
  public:
@@ -43,7 +75,9 @@ class RouteGuideClient {
 
   // Returns true when the RPC succeeded (an empty feature name is a valid
   // "nothing there" answer, matching the route_guide service contract).
-  bool GetFeature(int32_t latitude, int32_t longitude, int deadline_ms) {
+  // `verbose` also dumps server metadata; the concurrent mode keeps output
+  // single-line-per-run instead.
+  bool GetFeature(int32_t latitude, int32_t longitude, int deadline_ms, bool verbose) {
     Point point;
     point.set_latitude(latitude);
     point.set_longitude(longitude);
@@ -57,13 +91,53 @@ class RouteGuideClient {
     Feature feature;
     Status status = stub_->GetFeature(&context, point, &feature);
     if (!status.ok()) {
-      std::printf("GETFEATURE error code=%d message=%s\n", static_cast<int>(status.error_code()),
-                  status.error_message().c_str());
+      if (verbose) {
+        std::printf("GETFEATURE error code=%d message=%s\n", static_cast<int>(status.error_code()),
+                    status.error_message().c_str());
+        PrintMetadata("INITIAL", context.GetServerInitialMetadata());
+        PrintMetadata("TRAILING", context.GetServerTrailingMetadata());
+      }
       return false;
     }
-    std::printf("GETFEATURE ok name=%s latitude=%d longitude=%d\n", feature.name().c_str(),
-                feature.location().latitude(), feature.location().longitude());
+    if (verbose) {
+      std::printf("GETFEATURE ok name=%s latitude=%d longitude=%d\n", feature.name().c_str(),
+                  feature.location().latitude(), feature.location().longitude());
+      PrintMetadata("INITIAL", context.GetServerInitialMetadata());
+      PrintMetadata("TRAILING", context.GetServerTrailingMetadata());
+    }
     return true;
+  }
+
+  // M4 contract check for the not-yet-implemented server-streaming path
+  // (real implementation lands in M5): Read() must yield nothing and
+  // Finish() must report UNIMPLEMENTED — never a hang or a crash.
+  void ListFeatures() {
+    Rectangle rect;
+    ClientContext context;
+    std::unique_ptr<grpc::ClientReader<Feature>> reader(stub_->ListFeatures(&context, rect));
+    Feature feature;
+    int messages = 0;
+    while (reader->Read(&feature)) ++messages;
+    Status status = reader->Finish();
+    std::printf("LISTFEATURES code=%d messages=%d\n", static_cast<int>(status.error_code()),
+                messages);
+  }
+
+  // TSan fodder: hammer the channel from `threads` caller threads at once
+  // (design §3: callers only touch the op queue + per-call condvar).
+  void ConcurrentGetFeature(int threads, int32_t latitude, int32_t longitude, int deadline_ms) {
+    std::atomic<int> ok{0};
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<size_t>(threads));
+    for (int i = 0; i < threads; ++i) {
+      workers.emplace_back([&] {
+        if (GetFeature(latitude, longitude, deadline_ms, /*verbose=*/false)) {
+          ok.fetch_add(1, std::memory_order_relaxed);
+        }
+      });
+    }
+    for (auto& w : workers) w.join();
+    std::printf("CONCURRENT ok=%d total=%d\n", ok.load(), threads);
   }
 
  private:
@@ -84,21 +158,27 @@ bool ReadFile(const char* path, std::string* out) {
 int main(int argc, char** argv) {
   std::string target;
   std::string ca_file;
+  std::string mode = "getfeature";
   int32_t latitude = 1000;
   int32_t longitude = 2000;
   int deadline_ms = 0;
+  int threads = 8;
 
   for (int i = 1; i + 1 < argc; i += 2) {
     if (std::strcmp(argv[i], "--target") == 0) {
       target = argv[i + 1];
     } else if (std::strcmp(argv[i], "--ca-file") == 0) {
       ca_file = argv[i + 1];
+    } else if (std::strcmp(argv[i], "--mode") == 0) {
+      mode = argv[i + 1];
     } else if (std::strcmp(argv[i], "--latitude") == 0) {
       latitude = std::atoi(argv[i + 1]);
     } else if (std::strcmp(argv[i], "--longitude") == 0) {
       longitude = std::atoi(argv[i + 1]);
     } else if (std::strcmp(argv[i], "--deadline-ms") == 0) {
       deadline_ms = std::atoi(argv[i + 1]);
+    } else if (std::strcmp(argv[i], "--threads") == 0) {
+      threads = std::atoi(argv[i + 1]);
     } else {
       std::fprintf(stderr, "unknown flag: %s\n", argv[i]);
       return 2;
@@ -107,7 +187,8 @@ int main(int argc, char** argv) {
   if (target.empty() || ca_file.empty()) {
     std::fprintf(stderr,
                  "usage: %s --target host:port --ca-file cert.pem"
-                 " [--latitude N] [--longitude N] [--deadline-ms N]\n",
+                 " [--mode getfeature|listfeatures|concurrent]"
+                 " [--latitude N] [--longitude N] [--deadline-ms N] [--threads N]\n",
                  argv[0]);
     return 2;
   }
@@ -119,5 +200,17 @@ int main(int argc, char** argv) {
   }
 
   RouteGuideClient client(grpc::CreateChannel(target, grpc::SslCredentials(ssl)));
-  return client.GetFeature(latitude, longitude, deadline_ms) ? 0 : 1;
+  if (mode == "getfeature") {
+    return client.GetFeature(latitude, longitude, deadline_ms, /*verbose=*/true) ? 0 : 1;
+  }
+  if (mode == "listfeatures") {
+    client.ListFeatures();
+    return 0;
+  }
+  if (mode == "concurrent") {
+    client.ConcurrentGetFeature(threads, latitude, longitude, deadline_ms);
+    return 0;
+  }
+  std::fprintf(stderr, "unknown mode: %s\n", mode.c_str());
+  return 2;
 }

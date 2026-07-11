@@ -11,6 +11,21 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 Certs = collections.namedtuple("Certs", ["cert", "key"])
 
 
+def require_test_binary(path, build_hint):
+    """Skip locally when a test binary is missing — but FAIL in CI.
+
+    A skip on a missing binary is developer convenience; in CI it would
+    silently drop whole acceptance suites if build configuration drifts
+    (e.g. examples get disabled), so there it must be loud.
+    """
+    if os.path.isfile(path):
+        return
+    msg = "test binary not found at {}; {}".format(path, build_hint)
+    if os.environ.get("CI"):
+        pytest.fail(msg + " (missing binaries are a CI failure, not a skip)")
+    pytest.skip(msg, allow_module_level=True)
+
+
 @pytest.fixture(scope="session")
 def certs(tmp_path_factory):
     """Generate a self-signed cert+key via the openssl CLI (session-scoped)."""
@@ -36,12 +51,10 @@ def probe_bin():
     """Absolute path to the compiled egrpc_tls_connect probe binary."""
     build_dir = os.environ.get("EGRPC_BUILD_DIR") or os.path.join(_REPO_ROOT, "build")
     path = os.path.join(build_dir, "tests", "integration", "egrpc_tls_connect")
-    if not os.path.isfile(path):
-        pytest.skip(
-            "probe binary not found at {}; build the project first: "
-            "cmake -S . -B build && cmake --build build -j".format(path),
-            allow_module_level=True,
-        )
+    require_test_binary(
+        path,
+        "build the project first: cmake -S . -B build && cmake --build build -j",
+    )
     return path
 
 

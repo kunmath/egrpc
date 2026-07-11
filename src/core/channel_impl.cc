@@ -15,7 +15,10 @@ using std::chrono::steady_clock;
 ChannelImpl::ChannelImpl(std::string host, uint16_t port, TlsConfig tls, ChannelOptions options)
     : host_(std::move(host)),
       port_(port),
-      authority_(host_ + ":" + std::to_string(port)),
+      // IPv6 literals must be re-bracketed in :authority (§5.1); host_ itself
+      // stays bare for the resolver and SNI.
+      authority_((host_.find(':') == std::string::npos ? host_ : "[" + host_ + "]") + ":" +
+                 std::to_string(port)),
       tls_(std::move(tls)),
       options_(options) {
   loop_ok_ = loop_.Start();

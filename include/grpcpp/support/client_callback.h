@@ -27,7 +27,7 @@ class ClientUnaryReactor {
   virtual ~ClientUnaryReactor() = default;
   void StartCall() { OnDone(internal::CallbackUnimplementedStatus()); }
   virtual void OnReadInitialMetadataDone(bool ok) { (void)ok; }
-  virtual void OnDone(const Status& s) = 0;
+  virtual void OnDone(const Status& s) { (void)s; }  // default no-op, matching upstream
 };
 
 template <class R>
@@ -41,7 +41,7 @@ class ClientReadReactor {
   void RemoveHold() {}
   virtual void OnReadInitialMetadataDone(bool ok) { (void)ok; }
   virtual void OnReadDone(bool ok) { (void)ok; }
-  virtual void OnDone(const Status& s) = 0;
+  virtual void OnDone(const Status& s) { (void)s; }  // default no-op, matching upstream
 };
 
 template <class W>
@@ -65,7 +65,7 @@ class ClientWriteReactor {
   virtual void OnReadInitialMetadataDone(bool ok) { (void)ok; }
   virtual void OnWriteDone(bool ok) { (void)ok; }
   virtual void OnWritesDoneDone(bool ok) { (void)ok; }
-  virtual void OnDone(const Status& s) = 0;
+  virtual void OnDone(const Status& s) { (void)s; }  // default no-op, matching upstream
 };
 
 template <class W, class R>
@@ -91,7 +91,7 @@ class ClientBidiReactor {
   virtual void OnReadDone(bool ok) { (void)ok; }
   virtual void OnWriteDone(bool ok) { (void)ok; }
   virtual void OnWritesDoneDone(bool ok) { (void)ok; }
-  virtual void OnDone(const Status& s) = 0;
+  virtual void OnDone(const Status& s) { (void)s; }  // default no-op, matching upstream
 };
 
 namespace internal {

@@ -12,6 +12,7 @@ import subprocess
 
 import pytest
 
+from conftest import require_test_binary
 from server.route_guide_server import RouteGuideTestServer
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -25,11 +26,10 @@ def shim_bin():
     path = os.path.join(
         build_dir, "examples", "route_guide", "egrpc_route_guide_client"
     )
-    if not os.path.isfile(path):
-        pytest.skip(
-            "example client not found at {}; build the project first: "
-            "cmake -S . -B build && cmake --build build -j".format(path)
-        )
+    require_test_binary(
+        path,
+        "build the project first: cmake -S . -B build && cmake --build build -j",
+    )
     return path
 
 
@@ -119,3 +119,83 @@ def test_large_response_reassembled(shim_bin, certs, route_guide_server):
     assert result.returncode == 0, _fail_msg(result)
     expected = "GETFEATURE ok name={} latitude=-3 longitude=0".format("x" * 200000)
     assert expected in result.stdout.splitlines(), _fail_msg(result)
+
+
+def test_deadline_reaches_server_as_grpc_timeout(shim_bin, certs, route_guide_server):
+    """The server echoes context.time_remaining(): 5 s deadline must arrive."""
+    result = _run_client(
+        shim_bin, certs, route_guide_server.port,
+        "--latitude", "-4", "--longitude", "0",
+        "--deadline-ms", "5000",
+    )
+    assert result.returncode == 0, _fail_msg(result)
+    line = next(
+        ln for ln in result.stdout.splitlines() if ln.startswith("GETFEATURE ok")
+    )
+    remaining = int(line.split("name=tr-")[1].split(" ")[0])
+    assert 1 <= remaining <= 5, _fail_msg(result)
+
+
+def test_no_deadline_means_no_grpc_timeout(shim_bin, certs, route_guide_server):
+    result = _run_client(
+        shim_bin, certs, route_guide_server.port,
+        "--latitude", "-4", "--longitude", "0",
+    )
+    assert result.returncode == 0, _fail_msg(result)
+    assert (
+        "GETFEATURE ok name=tr-none latitude=-4 longitude=0"
+        in result.stdout.splitlines()
+    ), _fail_msg(result)
+
+
+def test_initial_metadata_exposed_via_client_context(
+    shim_bin, certs, route_guide_server
+):
+    result = _run_client(
+        shim_bin, certs, route_guide_server.port,
+        "--latitude", "1000", "--longitude", "2000",
+    )
+    assert result.returncode == 0, _fail_msg(result)
+    assert "INITIAL egrpc-initial=iv1" in result.stdout.splitlines(), _fail_msg(result)
+
+
+def test_trailing_metadata_exposed_with_bin_decoding(
+    shim_bin, certs, route_guide_server
+):
+    """Trailers-Only error path: text and -bin (base64→bytes) trailing metadata."""
+    result = _run_client(
+        shim_bin, certs, route_guide_server.port,
+        "--latitude", "-1",
+    )
+    assert result.returncode == 1, _fail_msg(result)
+    lines = result.stdout.splitlines()
+    assert "TRAILING egrpc-test-trailer=tv1" in lines, _fail_msg(result)
+    # b"\x00\x01", base64 on the wire, decoded by the shim, hex-escaped by
+    # the example client for line-oriented output.
+    assert "TRAILING egrpc-bin-bin=\\x00\\x01" in lines, _fail_msg(result)
+
+
+def test_server_streaming_stub_reports_unimplemented(
+    shim_bin, certs, route_guide_server
+):
+    """M4 contract for the M5-pending ClientReader: no messages, UNIMPLEMENTED, no hang."""
+    result = _run_client(
+        shim_bin, certs, route_guide_server.port,
+        "--mode", "listfeatures",
+    )
+    assert result.returncode == 0, _fail_msg(result)
+    assert "LISTFEATURES code=12 messages=0" in result.stdout.splitlines(), _fail_msg(
+        result
+    )
+
+
+def test_concurrent_unary_calls(shim_bin, certs, route_guide_server):
+    """8 caller threads on one channel (design §3); all must succeed."""
+    result = _run_client(
+        shim_bin, certs, route_guide_server.port,
+        "--mode", "concurrent", "--threads", "8",
+        "--latitude", "1000", "--longitude", "2000",
+        "--deadline-ms", "15000",
+    )
+    assert result.returncode == 0, _fail_msg(result)
+    assert "CONCURRENT ok=8 total=8" in result.stdout.splitlines(), _fail_msg(result)

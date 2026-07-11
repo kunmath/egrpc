@@ -1,7 +1,9 @@
 // egrpc grpcpp shim — async unary types (design §4.5): compile-present
 // only. Async completion-queue calls are permanently out of scope (design
-// §2); the objects are inert — every started operation pairs with a
-// CompletionQueue that behaves as shut down, so nothing blocks forever.
+// §2); operations perform no I/O, but tagged ones deliver their tag through
+// the bound CompletionQueue (Finish with ok=true after depositing an
+// UNIMPLEMENTED status, per upstream's "client-side Finish is always ok"),
+// so a well-formed async caller observes completion and terminates.
 #pragma once
 
 #include <grpcpp/client_context.h>
@@ -30,18 +32,22 @@ template <class R>
 class ClientAsyncResponseReader final : public ClientAsyncResponseReaderInterface<R> {
  public:
   void StartCall() override {}
-  void ReadInitialMetadata(void* tag) override { (void)tag; }
+  void ReadInitialMetadata(void* tag) override {
+    if (cq_ != nullptr) cq_->EgrpcEnqueueTag(tag, false);
+  }
   void Finish(R* msg, Status* status, void* tag) override {
     (void)msg;
-    (void)tag;
     if (status != nullptr) {
       *status = Status(StatusCode::UNIMPLEMENTED, "async API not supported by egrpc");
     }
+    if (cq_ != nullptr) cq_->EgrpcEnqueueTag(tag, true);
   }
 
  private:
   friend class internal::ClientAsyncResponseReaderHelper;
-  ClientAsyncResponseReader() = default;
+  explicit ClientAsyncResponseReader(CompletionQueue* cq) : cq_(cq) {}
+
+  CompletionQueue* const cq_;
 };
 
 namespace internal {
@@ -53,11 +59,10 @@ class ClientAsyncResponseReaderHelper {
                                               const RpcMethod& method, grpc::ClientContext* context,
                                               const W& request) {
     (void)channel;
-    (void)cq;
     (void)method;
     (void)context;
     (void)request;
-    return new ClientAsyncResponseReader<R>();
+    return new ClientAsyncResponseReader<R>(cq);
   }
 };
 

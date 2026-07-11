@@ -22,6 +22,8 @@ import time
 
 import pytest
 
+from conftest import require_test_binary
+
 from server.h2_test_server import H2TestServer
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -34,11 +36,10 @@ def keepalive_probe_bin():
         _REPO_ROOT, "build"
     )
     path = os.path.join(build_dir, "tests", "integration", "egrpc_h2_keepalive")
-    if not os.path.isfile(path):
-        pytest.skip(
-            "probe binary not found at {}; build the project first: "
-            "cmake -S . -B build && cmake --build build -j".format(path)
-        )
+    require_test_binary(
+        path,
+        "build the project first: cmake -S . -B build && cmake --build build -j",
+    )
     return path
 
 
