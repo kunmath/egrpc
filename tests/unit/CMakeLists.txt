@@ -12,6 +12,7 @@ add_executable(egrpc_unit_tests
   test_wakeup.cc
   test_event_thread.cc
   test_http2_session.cc
+  test_grpc_wire.cc
 )
 
 target_include_directories(egrpc_unit_tests SYSTEM PRIVATE
@@ -24,3 +25,8 @@ target_link_libraries(egrpc_unit_tests PRIVATE egrpc_static)
 target_compile_options(egrpc_unit_tests PRIVATE -Wall -Wextra -Werror)
 
 add_test(NAME egrpc_unit_tests COMMAND egrpc_unit_tests)
+
+# Focused registration so `ctest -R grpc_wire` runs just the wire-format helper
+# tests (all in the "grpc_wire" doctest suite; see test_grpc_wire.cc).
+add_test(NAME egrpc_wire_tests
+  COMMAND egrpc_unit_tests --test-suite=grpc_wire)

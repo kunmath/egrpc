@@ -52,6 +52,7 @@ set(EGRPC_SOURCES
   src/core/event_thread.cc
   src/core/channel_impl.cc
   src/core/call_state.cc
+  src/core/grpc_wire.cc
   src/core/backoff.cc
   src/api/serialization.cc
 )

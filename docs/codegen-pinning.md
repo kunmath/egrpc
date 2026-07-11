@@ -44,6 +44,34 @@ smoke test passes, records all pinned versions; re-runs no-op) and re-does every
 and requires cmake >= 3.16, a C++17 compiler, `curl`, and `unzip`. `JOBS` controls
 build parallelism (default `$(nproc)`).
 
+## Message codegen vs. stub codegen (M3 clarification)
+
+The pin above freezes the **`grpc_cpp_plugin` stub contract** (`.grpc.pb.h/.cc`
+↔ the `grpcpp/` shim). It does **not** govern protobuf *message* codegen
+(`.pb.h/.cc`): protobuf generated code must match the protobuf **runtime** it
+compiles against, and egrpc's runtime is the **system** protobuf-lite (design
+§1 — no vendoring; Yocto provides it). protoc 35.0 output cannot compile
+against the 3.21.x runtime that current Ubuntu/CI images ship, so using the
+pinned protoc for message codegen is impossible by construction.
+
+Policy for message codegen: checked-in `.pb.h/.cc` files (e.g.
+`examples/route_guide/gen/`) are generated with the **official prebuilt protoc
+matching the minimum supported system runtime** — for v0.1 that is
+**protoc 21.12** (== protobuf C++ 3.21.12,
+`protoc-21.12-linux-x86_64.zip`, SHA-256
+`3a4c1e5f2516c639d3079b1586e703fc7bcfa2136d58bda24d1d54f949c315e8`).
+Newer runtimes accept older gencode within protobuf's documented
+compatibility window, so these files also build on newer distros; targets
+whose runtime falls outside that window (e.g. a future Yocto LTS) regenerate
+from the `.proto` with their own matching protoc.
+
+Open item for M4: the CI stub-diff will drive the pinned `grpc_cpp_plugin`
+from the host protoc; the plugin (built on protobuf 35.0) must accept the
+CodeGeneratorRequest a 21.12 protoc produces — verify this when wiring the
+M4 CI job, and if it does not hold, drive it from the pinned protoc 35.0
+instead (the plugin does not emit message code, so the runtime constraint
+does not apply to its output).
+
 ## Policy (design §4.5)
 
 - **One `grpc_cpp_plugin` version is pinned per egrpc release.** Never regenerate

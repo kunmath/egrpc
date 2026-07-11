@@ -15,10 +15,33 @@ namespace internal {
 // nghttp2 callbacks. Declared as a friend of Http2Session in the header so the
 // static trampolines can reach the private state directly.
 struct Http2Session::Impl {
+  static Stream* FindStream(Http2Session* self, int32_t stream_id) {
+    const auto it = self->streams_.find(stream_id);
+    return it == self->streams_.end() ? nullptr : it->second.get();
+  }
+
   static int OnFrameRecv(nghttp2_session* /*session*/, const nghttp2_frame* frame,
                          void* user_data) {
     auto* self = static_cast<Http2Session*>(user_data);
     switch (frame->hd.type) {
+      case NGHTTP2_HEADERS: {
+        Stream* stream = FindStream(self, frame->hd.stream_id);
+        if (stream == nullptr) break;
+        HeaderList headers = std::move(stream->pending_headers);
+        stream->pending_headers.clear();
+        // HCAT_RESPONSE is the first (initial) response HEADERS; anything
+        // later on the stream is trailers. Trailers-Only responses arrive as
+        // HCAT_RESPONSE with END_STREAM (design §4.3).
+        if (frame->headers.cat == NGHTTP2_HCAT_RESPONSE) {
+          const bool end_stream = (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0;
+          if (stream->hooks.on_response_headers) {
+            stream->hooks.on_response_headers(std::move(headers), end_stream);
+          }
+        } else if (stream->hooks.on_trailers) {
+          stream->hooks.on_trailers(std::move(headers));
+        }
+        break;
+      }
       case NGHTTP2_SETTINGS:
         if (frame->hd.flags & NGHTTP2_FLAG_ACK) {
           if (self->hooks_.on_settings_ack) self->hooks_.on_settings_ack();
@@ -52,6 +75,55 @@ struct Http2Session::Impl {
     }
     return 0;
   }
+
+  static int OnHeader(nghttp2_session* /*session*/, const nghttp2_frame* frame, const uint8_t* name,
+                      size_t namelen, const uint8_t* value, size_t valuelen, uint8_t /*flags*/,
+                      void* user_data) {
+    auto* self = static_cast<Http2Session*>(user_data);
+    if (frame->hd.type != NGHTTP2_HEADERS) return 0;
+    Stream* stream = FindStream(self, frame->hd.stream_id);
+    if (stream == nullptr) return 0;
+    stream->pending_headers.emplace_back(
+        std::string(reinterpret_cast<const char*>(name), namelen),
+        std::string(reinterpret_cast<const char*>(value), valuelen));
+    return 0;
+  }
+
+  static int OnDataChunkRecv(nghttp2_session* /*session*/, uint8_t /*flags*/, int32_t stream_id,
+                             const uint8_t* data, size_t len, void* user_data) {
+    auto* self = static_cast<Http2Session*>(user_data);
+    Stream* stream = FindStream(self, stream_id);
+    if (stream != nullptr && stream->hooks.on_data) stream->hooks.on_data(data, len);
+    return 0;
+  }
+
+  static int OnStreamClose(nghttp2_session* /*session*/, int32_t stream_id, uint32_t error_code,
+                           void* user_data) {
+    auto* self = static_cast<Http2Session*>(user_data);
+    const auto it = self->streams_.find(stream_id);
+    if (it == self->streams_.end()) return 0;
+    // Detach before invoking on_close so the stream is already gone if the
+    // hook inspects session state; on_close is the last hook for a stream.
+    const std::unique_ptr<Stream> stream = std::move(it->second);
+    self->streams_.erase(it);
+    --self->active_streams_;
+    if (stream->hooks.on_close) stream->hooks.on_close(error_code);
+    return 0;
+  }
+
+  // Data provider for SubmitUnaryRequest: reads from the stream's in-memory
+  // body, EOF (→ END_STREAM, the unary half-close) once drained.
+  static ssize_t DataSourceRead(nghttp2_session* /*session*/, int32_t /*stream_id*/, uint8_t* buf,
+                                size_t length, uint32_t* data_flags, nghttp2_data_source* source,
+                                void* /*user_data*/) {
+    auto* stream = static_cast<Stream*>(source->ptr);
+    const size_t remaining = stream->body.size() - stream->body_offset;
+    const size_t n = std::min(length, remaining);
+    std::memcpy(buf, stream->body.data() + stream->body_offset, n);
+    stream->body_offset += n;
+    if (stream->body_offset == stream->body.size()) *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+    return static_cast<ssize_t>(n);
+  }
 };
 
 Http2Session::Http2Session(const Http2SessionOptions& options, Hooks hooks, TimePoint now)
@@ -62,6 +134,9 @@ Http2Session::Http2Session(const Http2SessionOptions& options, Hooks hooks, Time
     return;
   }
   nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, &Impl::OnFrameRecv);
+  nghttp2_session_callbacks_set_on_header_callback(callbacks, &Impl::OnHeader);
+  nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks, &Impl::OnDataChunkRecv);
+  nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, &Impl::OnStreamClose);
 
   const int new_rc = nghttp2_session_client_new(&session_, callbacks, this);
   nghttp2_session_callbacks_del(callbacks);
@@ -118,6 +193,46 @@ bool Http2Session::ReceiveBytes(TimePoint now, const uint8_t* data, size_t len) 
     return false;
   }
   return true;
+}
+
+int32_t Http2Session::SubmitUnaryRequest(const HeaderList& headers, std::string body,
+                                         StreamHooks hooks) {
+  if (session_ == nullptr) {
+    error_ = "session not initialized";
+    return -1;
+  }
+  if (draining_) {
+    error_ = "session is draining (GOAWAY received); no new streams";
+    return -1;
+  }
+
+  auto stream = std::make_unique<Stream>();
+  stream->hooks = std::move(hooks);
+  stream->body = std::move(body);
+
+  // nghttp2_nv wants non-const pointers but copies names and values during
+  // submit (no NO_COPY flags set), so the casts do not outlive this call.
+  std::vector<nghttp2_nv> nva;
+  nva.reserve(headers.size());
+  for (const Header& h : headers) {
+    nva.push_back({reinterpret_cast<uint8_t*>(const_cast<char*>(h.first.data())),
+                   reinterpret_cast<uint8_t*>(const_cast<char*>(h.second.data())), h.first.size(),
+                   h.second.size(), NGHTTP2_NV_FLAG_NONE});
+  }
+
+  nghttp2_data_provider provider{};
+  provider.source.ptr = stream.get();
+  provider.read_callback = &Impl::DataSourceRead;
+
+  const int32_t stream_id =
+      nghttp2_submit_request(session_, nullptr, nva.data(), nva.size(), &provider, nullptr);
+  if (stream_id < 0) {
+    error_ = std::string("nghttp2_submit_request failed: ") + nghttp2_strerror(stream_id);
+    return -1;
+  }
+  streams_.emplace(stream_id, std::move(stream));
+  ++active_streams_;
+  return stream_id;
 }
 
 const uint8_t* Http2Session::PendingOutput(size_t* len) {
@@ -204,6 +319,12 @@ Http2Session::KeepaliveAction Http2Session::CheckKeepalive(TimePoint now) {
     return KeepaliveAction::kPingSent;
   }
   return KeepaliveAction::kNone;
+}
+
+void Http2Session::Terminate() {
+  if (session_ == nullptr) return;
+  nghttp2_session_terminate_session(session_, NGHTTP2_NO_ERROR);
+  draining_ = true;
 }
 
 bool Http2Session::draining() const { return draining_; }

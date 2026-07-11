@@ -68,7 +68,7 @@ per egrpc release**, verified in CI by regenerating stubs and compiling.
 - **M0 — Scaffold (CMake, pin-codegen.sh, CI, test skeleton): done**
 - **M1 — Transport bring-up (TlsSocket, Wakeup, TimerHeap, EventThread skeleton): done**
 - **M2 — HTTP/2 session + keepalive plumbing: done**
-- M3 — Hand-rolled unary call end-to-end: not started
+- **M3 — Hand-rolled unary call end-to-end: done**
 - M4 — Shim: unary via unmodified generated stubs: not started
 - M5 — Server-streaming + deadlines + cancellation: not started
 - M6 — Resilience: reconnect, keepalive enforcement, shutdown: not started

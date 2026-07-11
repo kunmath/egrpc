@@ -25,8 +25,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
+#include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 // Forward declaration so this header does not leak <nghttp2/nghttp2.h>.
@@ -69,6 +72,30 @@ class Http2Session {
     std::function<void(uint32_t error_code, int32_t last_stream_id, bool too_many_pings)> on_goaway;
   };
 
+  // One (name, value) header pair; names are already lowercase per HTTP/2.
+  using Header = std::pair<std::string, std::string>;
+  using HeaderList = std::vector<Header>;
+
+  // Response-side events for one stream. All callbacks fire on the owning
+  // thread from inside ReceiveBytes(); they may not call back into the
+  // session (single-threaded byte machine, §4.2 — the owner queues follow-up
+  // work instead).
+  struct StreamHooks {
+    // Initial response HEADERS. end_stream=true is the Trailers-Only case
+    // (design §4.3): this HEADERS carries grpc-status and no DATA follows.
+    std::function<void(HeaderList headers, bool end_stream)> on_response_headers;
+    // Trailing HEADERS (always ends the stream).
+    std::function<void(HeaderList trailers)> on_trailers;
+    // One DATA chunk (may be any slice of a gRPC message; the CallState
+    // scanner reassembles).
+    std::function<void(const uint8_t* data, size_t len)> on_data;
+    // Stream fully closed. error_code is the HTTP/2 error code
+    // (0 = NO_ERROR); fires exactly once, after which no other hook runs.
+    // Streams still open when the session is torn down do NOT get on_close —
+    // transport teardown is the owner's signal to fail remaining calls.
+    std::function<void(uint32_t error_code)> on_close;
+  };
+
   enum class KeepaliveAction {
     kNone,      // nothing due; re-arm from NextKeepaliveDeadline
     kPingSent,  // keepalive PING queued — flush output, re-arm
@@ -105,6 +132,19 @@ class Http2Session {
   // True if the session has (or may generate) output — poll for POLLOUT.
   bool WantWrite();
 
+  // --- Streams (§4.3 send path) --------------------------------------------
+  // Submits a unary request: HEADERS (from `headers`, in order, pseudo-
+  // headers first) followed by `body` — the already-framed gRPC message —
+  // sent via a data provider with END_STREAM at the end (unary half-closes
+  // immediately). An empty body still half-closes with an empty DATA/EOF.
+  // Returns the stream id (> 0), or -1 on failure (error() has detail; the
+  // draining() case fails here too — no new streams after GOAWAY).
+  // The frames land in the output buffer on the next PendingOutput() pass.
+  int32_t SubmitUnaryRequest(const HeaderList& headers, std::string body, StreamHooks hooks);
+
+  // Streams with hooks still registered (submitted, not yet closed).
+  int active_streams() const { return active_streams_; }
+
   // --- Keepalive (§5.2) ----------------------------------------------------
   // When the owner's keepalive timer should next fire, given current state:
   //   - ping outstanding → ping_sent_time + keepalive_timeout
@@ -122,6 +162,11 @@ class Http2Session {
   //   - else kNone.
   KeepaliveAction CheckKeepalive(TimePoint now);
 
+  // Queues a graceful session termination (GOAWAY, NO_ERROR — design §5.7).
+  // The owner flushes PendingOutput() best-effort afterwards. No new streams
+  // after this; the session is draining.
+  void Terminate();
+
   // --- GOAWAY / errors ------------------------------------------------------
   // True once GOAWAY was received: no new streams; in-flight work drains.
   bool draining() const;
@@ -137,6 +182,17 @@ class Http2Session {
  private:
   struct Impl;  // nghttp2 callbacks live in the .cc
   friend struct Impl;
+
+  // Per-stream state: the outbound body the data provider reads from, the
+  // header list being accumulated for the current HEADERS frame, and the
+  // owner's hooks. Owned by streams_; freed from the on_stream_close
+  // callback after on_close fires.
+  struct Stream {
+    StreamHooks hooks;
+    std::string body;
+    size_t body_offset = 0;
+    HeaderList pending_headers;  // filled by on_header, drained on frame end
+  };
 
   Http2SessionOptions options_;
   Hooks hooks_;
@@ -154,7 +210,8 @@ class Http2Session {
   bool ping_outstanding_ = false;
   uint64_t ping_counter_ = 0;
   uint64_t pings_acked_ = 0;
-  int active_streams_ = 0;  // maintained from M3 on; 0 throughout M2
+  int active_streams_ = 0;  // == streams_.size(); kept as int for keepalive checks
+  std::map<int32_t, std::unique_ptr<Stream>> streams_;
 
   bool draining_ = false;
   bool too_many_pings_ = false;

@@ -46,7 +46,7 @@ jobs:
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: |
           python3 -m venv .venv
-          .venv/bin/pip install pytest h2
+          .venv/bin/pip install pytest h2 grpcio grpcio-tools
           .venv/bin/pytest tests -v
 
   # TSan is mandatory from M1 on (design §9): the condvar-heavy threading
@@ -85,7 +85,7 @@ jobs:
       - name: Run pytest harness
         run: |
           python3 -m venv .venv
-          .venv/bin/pip install pytest h2
+          .venv/bin/pip install pytest h2 grpcio grpcio-tools
           .venv/bin/pytest tests -v
 
   format:
