@@ -63,11 +63,14 @@ class TlsSocket {
   TlsSocket(const TlsSocket&) = delete;
   TlsSocket& operator=(const TlsSocket&) = delete;
 
-  // Resolves host (blocking getaddrinfo — the EventThread accepts this cost
-  // per design: DNS via getaddrinfo, no c-ares) and starts a non-blocking
-  // connect to the first address; remaining addresses are fallbacks tried on
-  // connect failure. Returns false and sets state kFailed on immediate
-  // failure (resolution, socket creation, or CA/cert config errors).
+  // Resolves host (blocking getaddrinfo — acceptable only while transport
+  // failure is channel-terminal, i.e. through M5; design §4.1 moves
+  // resolution to a helper thread with generation-tagged results before M6's
+  // reconnect, after which Connect takes pre-resolved addresses) and starts
+  // a non-blocking connect to the first address; remaining addresses are
+  // fallbacks tried on connect failure. Returns false and sets state kFailed
+  // on immediate failure (resolution, socket creation, or CA/cert config
+  // errors).
   bool StartConnect(const std::string& host, uint16_t port, const TlsConfig& config);
 
   // Drives TCP connect + TLS handshake. Call after StartConnect() and then

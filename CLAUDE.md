@@ -71,6 +71,8 @@ per egrpc release**, verified in CI by regenerating stubs and compiling.
 - **M2 — HTTP/2 session + keepalive plumbing: done**
 - **M3 — Hand-rolled unary call end-to-end: done**
 - **M4 — Shim: unary via unmodified generated stubs: done**
+- Pre-M5 gate (§8a): scarthgap bitbake spike validating the protobuf matrix —
+  scarthgap is the sole supported Yocto LTS for v0.1 (decided)
 - M5 — Server-streaming + deadlines + cancellation: not started
 - M6 — Resilience: reconnect, keepalive enforcement, shutdown: not started
 - M7 — resilient_stream + native config API: not started
