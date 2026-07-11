@@ -12,6 +12,7 @@
 // additionally joins the loop.
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -69,6 +70,10 @@ class ChannelImpl {
       const std::string& method_path, std::string request, Http2Session::HeaderList metadata = {},
       std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt);
 
+  // Diagnostics/tests: high-water mark of concurrently active calls.
+  // Readable from any thread (atomic; written on the EventThread).
+  size_t max_active_calls() const { return max_active_calls_.load(std::memory_order_relaxed); }
+
   // Design §5.7 (M3 subset): refuse new calls with kUnavailable, fail
   // in-flight calls, terminate the HTTP/2 session gracefully with a
   // best-effort flush, close the socket, join the EventThread. Idempotent;
@@ -95,6 +100,15 @@ class ChannelImpl {
   void StartSession();
   void OnSocketReady(short revents);
   void SubmitCall(PendingCall pc);
+  // Concurrent-stream admission cap: min(local max_concurrent_streams,
+  // server's advertised SETTINGS value). Calls beyond it wait in
+  // pending_calls_.
+  size_t MaxConcurrentCalls() const;
+  // Submits queued calls while below the cap. Called wherever a slot may
+  // have freed (stream close) or the cap may have grown (server SETTINGS)
+  // — both only surface from the receive path, and never from inside an
+  // Http2Session callback (the session must not be re-entered, §4.2).
+  void PumpPendingCalls();
   void FlushOutput();
   void DrainSocket();
   void RearmKeepalive();
@@ -125,9 +139,14 @@ class ChannelImpl {
   std::unique_ptr<Http2Session> h2_;
   TimerId connect_timer_ = 0;
   TimerId keepalive_timer_ = 0;
-  std::vector<PendingCall> pending_calls_;  // queued while kConnecting
+  // Queued while kConnecting, and while at the concurrent-stream cap.
+  std::vector<PendingCall> pending_calls_;
   std::map<CallState*, std::shared_ptr<CallState>> active_calls_;
   std::string failure_detail_;  // why state_ == kFailed
+
+  // High-water mark of active_calls_.size(); written on the EventThread,
+  // read from test/diagnostic threads.
+  std::atomic<size_t> max_active_calls_{0};
 };
 
 }  // namespace internal

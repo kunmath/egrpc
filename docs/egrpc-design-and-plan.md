@@ -102,7 +102,7 @@ Non-blocking TCP connect via `getaddrinfo` (honoring a connect timeout), then Op
 
 RAII wrapper around `nghttp2_session_client_new` wiring the standard callbacks (`on_frame_recv`, `on_data_chunk_recv`, `on_stream_close`, `on_header`, `send`/`recv` via memory buffers flushed to `TlsSocket`). Owns:
 
-- **SETTINGS:** advertise `MAX_CONCURRENT_STREAMS` (small, e.g. 8), initial window sizes tuned for constrained memory (see flow control, §5.4).
+- **SETTINGS:** advertise `MAX_CONCURRENT_STREAMS` (small, e.g. 8), initial window sizes tuned for constrained memory (see flow control, §5.4). The client-sent setting only limits server-initiated streams (which don't exist in gRPC), so the same value is enforced locally as an admission cap: at most `min(local max_concurrent_streams, server-advertised MAX_CONCURRENT_STREAMS)` calls are active at once; excess calls queue in the channel and submit as slots free.
 - **PING transmission and ack tracking** for keepalive (§5.2).
 - **GOAWAY handling:** mark channel as draining; in-flight calls run to completion where possible; new calls trigger reconnect.
 

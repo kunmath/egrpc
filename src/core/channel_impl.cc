@@ -4,6 +4,7 @@
 
 #include <poll.h>
 
+#include <algorithm>
 #include <future>
 #include <utility>
 
@@ -99,9 +100,32 @@ void ChannelImpl::HandleNewCall(PendingCall pc) {
       pending_calls_.push_back(std::move(pc));
       return;
     case State::kReady:
+      if (active_calls_.size() >= MaxConcurrentCalls()) {
+        pending_calls_.push_back(std::move(pc));  // resumes in PumpPendingCalls
+        return;
+      }
       SubmitCall(std::move(pc));
       FlushOutput();
       return;
+  }
+}
+
+size_t ChannelImpl::MaxConcurrentCalls() const {
+  const uint32_t local = options_.http2.max_concurrent_streams;
+  if (h2_ == nullptr) return local;
+  // A server advertising 0 (legal: "no new streams now") makes the cap 0 and
+  // calls wait until a SETTINGS raise — submitting anyway would be a protocol
+  // error. TODO(M5): the queued wait is unbounded until per-call deadline
+  // timers land; they must fail queued calls with kDeadlineExceeded too.
+  return std::min(local, h2_->remote_max_concurrent_streams());
+}
+
+void ChannelImpl::PumpPendingCalls() {
+  while (state_ == State::kReady && !pending_calls_.empty() &&
+         active_calls_.size() < MaxConcurrentCalls()) {
+    PendingCall pc = std::move(pending_calls_.front());
+    pending_calls_.erase(pending_calls_.begin());
+    SubmitCall(std::move(pc));
   }
 }
 
@@ -157,18 +181,30 @@ void ChannelImpl::StartSession() {
 
   std::vector<PendingCall> pending = std::move(pending_calls_);
   pending_calls_.clear();
-  for (PendingCall& pc : pending) {
+  for (size_t i = 0; i < pending.size(); ++i) {
     if (state_ != State::kReady) {  // a submit error tore the channel down
-      pc.call->FailLocal(StatusCode::kUnavailable, failure_detail_);
+      pending[i].call->FailLocal(StatusCode::kUnavailable, failure_detail_);
       continue;
     }
-    SubmitCall(std::move(pc));
+    if (active_calls_.size() >= MaxConcurrentCalls()) {
+      // Over the admission cap: the rest wait for stream closes (or the
+      // server's SETTINGS raising the cap) via PumpPendingCalls.
+      pending_calls_.push_back(std::move(pending[i]));
+      continue;
+    }
+    SubmitCall(std::move(pending[i]));
   }
   if (state_ == State::kReady) FlushOutput();
 }
 
 void ChannelImpl::OnSocketReady(short revents) {
   if ((revents & (POLLIN | POLLERR | POLLHUP)) != 0) DrainSocket();
+  // Stream closes and server SETTINGS surface in DrainSocket; both can open
+  // admission slots. Safe here: the Http2Session callbacks have unwound.
+  // INVARIANT: today every slot-free arrives via this receive path. Any
+  // future path that closes a stream without socket readiness (M5 deadline/
+  // cancel timers) must also call PumpPendingCalls afterwards.
+  if (state_ == State::kReady) PumpPendingCalls();
   if (state_ == State::kReady) FlushOutput();
   if (state_ == State::kReady) RearmKeepalive();
 }
@@ -214,6 +250,9 @@ void ChannelImpl::SubmitCall(PendingCall pc) {
   }
   pc.call->OnSubmitted(stream_id);
   active_calls_.emplace(key, std::move(pc.call));
+  if (active_calls_.size() > max_active_calls_.load(std::memory_order_relaxed)) {
+    max_active_calls_.store(active_calls_.size(), std::memory_order_relaxed);
+  }
 }
 
 void ChannelImpl::FlushOutput() {

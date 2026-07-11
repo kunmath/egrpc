@@ -16,6 +16,7 @@ import importlib
 import os
 import sys
 import tempfile
+import time
 from concurrent import futures
 
 import grpc
@@ -114,6 +115,13 @@ class RouteGuideTestServer:
                         name = "tr-{}".format(int(round(remaining)))
                     return pb2.Feature(name=name, location=request)
 
+                # Slow point: sleep so that concurrent calls overlap on the
+                # server, letting the client-side concurrent-stream cap be
+                # observed (the server's thread pool must not serialize them).
+                if lat == -5:
+                    time.sleep(0.5)
+                    return pb2.Feature(name="slow", location=request)
+
                 # Known point: send initial metadata first, then the feature.
                 if lat == 1000 and lon == 2000:
                     context.send_initial_metadata((("egrpc-initial", "iv1"),))
@@ -127,7 +135,7 @@ class RouteGuideTestServer:
     def start(self):
         self._pb2, self._pb2_grpc = _generate_stubs()
 
-        self._server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
+        self._server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
         self._pb2_grpc.add_RouteGuideServicer_to_server(
             self._make_servicer(), self._server
         )

@@ -39,8 +39,12 @@ namespace egrpc {
 namespace internal {
 
 struct Http2SessionOptions {
-  // Advertised in our SETTINGS. Small by design (§4.2): one long-lived
-  // stream + a handful of unary calls.
+  // Local cap on concurrently active outbound streams, enforced by the
+  // channel's admission queue as min(this, server's advertised value) —
+  // as a client-sent SETTINGS entry alone it would only limit
+  // server-initiated streams, which don't exist in gRPC. Still advertised
+  // for transparency. Small by design (§4.2): one long-lived stream + a
+  // handful of unary calls.
   uint32_t max_concurrent_streams = 8;
 
   // SETTINGS_INITIAL_WINDOW_SIZE for streams, and the target connection
@@ -149,6 +153,12 @@ class Http2Session {
 
   // Streams with hooks still registered (submitted, not yet closed).
   int active_streams() const { return active_streams_; }
+
+  // The server's advertised SETTINGS_MAX_CONCURRENT_STREAMS. Before its
+  // first SETTINGS arrives this is nghttp2's RFC-default "unlimited"
+  // ((1u << 31) - 1). The channel admission cap is
+  // min(options.max_concurrent_streams, this) — see ChannelImpl.
+  uint32_t remote_max_concurrent_streams() const;
 
   // --- Keepalive (§5.2) ----------------------------------------------------
   // When the owner's keepalive timer should next fire, given current state:

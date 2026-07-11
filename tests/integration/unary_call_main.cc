@@ -15,6 +15,8 @@
 #include <cstring>
 #include <optional>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "core/channel_impl.h"
 #include "route_guide.pb.h"
@@ -25,7 +27,8 @@ int Usage(const char* argv0) {
   std::fprintf(stderr,
                "usage: %s --host H --port P [--ca FILE] [--insecure]\n"
                "          [--latitude N] [--longitude N] [--timeout-ms N]\n"
-               "          [--path /svc/Method] [--calls N]\n",
+               "          [--path /svc/Method] [--calls N]\n"
+               "          [--parallel N] [--max-streams N]\n",
                argv0);
   return 2;
 }
@@ -43,6 +46,8 @@ int main(int argc, char** argv) {
   int32_t longitude = 0;
   std::optional<std::chrono::milliseconds> timeout;
   int calls = 1;
+  int parallel = 0;
+  std::optional<uint32_t> max_streams;
 
   for (int i = 1; i < argc; ++i) {
     const std::string flag = argv[i];
@@ -68,26 +73,57 @@ int main(int argc, char** argv) {
       timeout = std::chrono::milliseconds(std::atoi(v));
     } else if (flag == "--calls") {
       calls = std::atoi(v);
+    } else if (flag == "--parallel") {
+      parallel = std::atoi(v);
+    } else if (flag == "--max-streams") {
+      max_streams = static_cast<uint32_t>(std::atoi(v));
     } else {
       return Usage(argv[0]);
     }
   }
   if (host.empty() || port == 0 || calls < 1) return Usage(argv[0]);
+  if (parallel != 0 && parallel < 2) return Usage(argv[0]);
 
-  egrpc::internal::ChannelImpl channel(host, port, tls, egrpc::internal::ChannelOptions{});
+  egrpc::internal::ChannelOptions options;
+  if (max_streams.has_value()) options.http2.max_concurrent_streams = *max_streams;
+  egrpc::internal::ChannelImpl channel(host, port, tls, options);
+
+  // Build the serialized request once; it is identical for every call.
+  routeguide::Point point;
+  point.set_latitude(latitude);
+  point.set_longitude(longitude);
+  std::string request;
+  if (!point.SerializeToString(&request)) {
+    std::fprintf(stderr, "FAILED: could not serialize request\n");
+    return 1;
+  }
+
+  if (parallel >= 2) {
+    // Concurrency mode: fire N one-shot calls from N threads to exercise the
+    // outbound concurrent-stream cap. Each thread prints exactly one atomic
+    // STATUS line; FEATURE/INITIAL/TRAILER output is skipped so that multi-line
+    // groups cannot interleave across threads.
+    std::vector<std::thread> threads;
+    threads.reserve(static_cast<size_t>(parallel));
+    for (int t = 0; t < parallel; ++t) {
+      threads.emplace_back([&]() {
+        std::optional<std::chrono::steady_clock::time_point> deadline;
+        if (timeout.has_value()) deadline = std::chrono::steady_clock::now() + *timeout;
+        const egrpc::internal::CallState::Result result =
+            channel.UnaryCall(path, request, {}, deadline);
+        std::printf("STATUS code=%d message=%s\n", static_cast<int>(result.code),
+                    result.message.c_str());
+      });
+    }
+    for (auto& th : threads) th.join();
+    std::printf("MAXACTIVE n=%zu\n", channel.max_active_calls());
+    channel.Shutdown();
+    return 0;
+  }
 
   // --calls > 1 exercises several unary calls over one connection (stream id
   // reuse, per-call scanner isolation).
   for (int call_index = 0; call_index < calls; ++call_index) {
-    routeguide::Point point;
-    point.set_latitude(latitude);
-    point.set_longitude(longitude);
-    std::string request;
-    if (!point.SerializeToString(&request)) {
-      std::fprintf(stderr, "FAILED: could not serialize request\n");
-      return 1;
-    }
-
     // UnaryCall takes an absolute steady-clock deadline; the per-call
     // --timeout-ms is relative to each call's start.
     std::optional<std::chrono::steady_clock::time_point> deadline;
