@@ -4,11 +4,12 @@
 // replace, and bounded clean shutdown.
 #include "core/channel_impl.h"
 
+#include <egrpc/log.h>
 #include <poll.h>
 
 #include <algorithm>
 #include <climits>
-#include <cstdio>
+#include <string>
 #include <utility>
 
 namespace egrpc {
@@ -596,11 +597,11 @@ void ChannelImpl::StartSession() {
       effective_keepalive_time_ = DoubleKeepaliveTime(old_time);
       effective_keepalive_time_ms_.store(effective_keepalive_time_.count(),
                                          std::memory_order_relaxed);
-      std::fprintf(stderr,
-                   "egrpc: WARN: received GOAWAY(ENHANCE_YOUR_CALM/too_many_pings); doubling "
-                   "keepalive_time from %lld ms to %lld ms\n",
-                   static_cast<long long>(old_time.count()),
-                   static_cast<long long>(effective_keepalive_time_.count()));
+      egrpc::Log(egrpc::LogLevel::kWarn, "keepalive",
+                 "received GOAWAY(ENHANCE_YOUR_CALM/too_many_pings); doubling keepalive_time "
+                 "from " +
+                     std::to_string(old_time.count()) + " ms to " +
+                     std::to_string(effective_keepalive_time_.count()) + " ms");
     }
     pending_goaway_process_ = true;
   };
