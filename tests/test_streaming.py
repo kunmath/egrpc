@@ -550,9 +550,14 @@ def test_max_queued_bytes_cap_independent_of_message_count(probe_bin, certs):
 
 
 def test_queued_call_pumps_after_flush_closes_malformed_stream(probe_bin, certs):
-    """When nghttp2 rejects malformed response HEADERS (missing :status) and
-    closes stream 1 only during FlushOutput(), a queued call behind
-    max_concurrent_streams=1 must still be pumped immediately without stalling.
+    """When nghttp2 rejects malformed response HEADERS (missing :status):
+    - libnghttp2 < 1.67 (without CVE-2025-8671 backport) queues a stream-level
+      RST_STREAM(PROTOCOL_ERROR) that closes stream 1 during FlushOutput(); the
+      queued call behind max_concurrent_streams=1 must be pumped immediately
+      and succeed on stream 3.
+    - libnghttp2 >= 1.67 (or backported) terminates the session with
+      GOAWAY(PROTOCOL_ERROR); ChannelImpl must tear down promptly and fail both
+      calls with UNAVAILABLE (14) without stalling.
     """
     with H2TestServer(certs.cert, certs.key, max_concurrent_streams=1) as srv:
         result = _run_probe(
@@ -560,12 +565,25 @@ def test_queued_call_pumps_after_flush_closes_malformed_stream(probe_bin, certs)
         )
         assert result.returncode == 0, _fail_msg(result)
         kv = _parse_kv_lines(result.stdout)
-        assert int(kv["CALL1_STATUS"]) != 0, _fail_msg(result)
-        assert int(kv["CALL2_STATUS"]) == 0, _fail_msg(result)
-        assert kv["CALL2_MSG"] == "second-ok", _fail_msg(result)
         assert int(kv["ELAPSED_MS"]) < 2000, _fail_msg(result)
-        resets = srv.wait_for_resets(count=1, timeout=3.0)
-        assert (1, _H2_PROTOCOL_ERROR) in resets, "expected RST_STREAM(PROTOCOL_ERROR) on stream 1"
+        call1_status = int(kv["CALL1_STATUS"])
+        call2_status = int(kv["CALL2_STATUS"])
+        if call2_status == 0:
+            assert call1_status == 13, _fail_msg(result)
+            assert kv["CALL2_MSG"] == "second-ok", _fail_msg(result)
+            resets = srv.wait_for_resets(count=1, timeout=3.0)
+            assert (1, _H2_PROTOCOL_ERROR) in resets, (
+                "expected RST_STREAM(PROTOCOL_ERROR) on stream 1"
+            )
+        else:
+            assert call1_status == 14, _fail_msg(result)
+            assert call2_status == 14, _fail_msg(result)
+            assert kv["CALL2_MSG"] == "", _fail_msg(result)
+            goaways = srv.wait_for_goaways(count=1, timeout=3.0)
+            assert (0, _H2_PROTOCOL_ERROR) in goaways, (
+                f"expected GOAWAY(0, PROTOCOL_ERROR), got goaways={goaways} resets={srv.resets}"
+            )
+            assert srv.requests == [1], f"unexpected requests={srv.requests}"
 
 
 def test_connection_protocol_error_tears_down_without_hanging(probe_bin, certs):

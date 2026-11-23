@@ -48,8 +48,9 @@ Modes:
 In "normal" mode, specific test paths also trigger targeted wire behaviors:
   - "/test.Stream/MalformedThenOk": on stream 1 send a raw HPACK-encoded
     HEADERS frame missing :status (triggering client nghttp2 RST_STREAM during
-    FlushOutput); on stream >= 2 reply normally with b"second-ok" and
-    grpc-status: 0.
+    FlushOutput on libnghttp2 < 1.67, or GOAWAY(PROTOCOL_ERROR) on
+    libnghttp2 >= 1.67 / CVE-2025-8671); on stream >= 2 reply normally with
+    b"second-ok" and grpc-status: 0.
   - "/test.Stream/ConnProtocolErrorThenPing": send initial :status 200 headers
     (no END_STREAM), then a raw invalid SETTINGS ACK frame with 6-byte payload
     on stream 0, then keep the socket open for 3 s sending raw PINGs every
@@ -219,6 +220,7 @@ class H2TestServer:
         self._lock = threading.Lock()
         self._reset_cond = threading.Condition(self._lock)
         self._req_cond = threading.Condition(self._lock)
+        self._goaway_cond = threading.Condition(self._lock)
 
         # Event timestamps / observations. Guarded by _lock for live reads.
         self._events = {
@@ -227,6 +229,7 @@ class H2TestServer:
             "pings": [],
             "requests": [],
             "resets": [],
+            "goaways": [],
             "connection_lost": None,
         }
 
@@ -250,6 +253,16 @@ class H2TestServer:
                 self._reset_cond.wait(rem)
             return list(self._events["resets"])
 
+    def wait_for_goaways(self, count=1, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        with self._goaway_cond:
+            while len(self._events["goaways"]) < count:
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    return list(self._events["goaways"])
+                self._goaway_cond.wait(rem)
+            return list(self._events["goaways"])
+
     @property
     def requests(self):
         with self._lock:
@@ -259,6 +272,11 @@ class H2TestServer:
     def resets(self):
         with self._lock:
             return list(self._events["resets"])
+
+    @property
+    def goaways(self):
+        with self._lock:
+            return list(self._events["goaways"])
 
     def _build_context(self):
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -422,6 +440,12 @@ class H2TestServer:
                             (event.stream_id, int(event.error_code))
                         )
                         self._reset_cond.notify_all()
+                elif isinstance(event, h2.events.ConnectionTerminated):
+                    with self._goaway_cond:
+                        self._events["goaways"].append(
+                            (event.last_stream_id, int(event.error_code))
+                        )
+                        self._goaway_cond.notify_all()
 
             # drop_on_request: immediately drop the TLS socket on the first
             # RequestReceived to exercise client TearDown with active calls.

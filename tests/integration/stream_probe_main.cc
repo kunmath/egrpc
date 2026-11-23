@@ -351,11 +351,19 @@ int RunQueuedAfterMalformed(const std::string& host, uint16_t port, const std::s
   std::printf("CALL2_STATUS=%d\n", call2_status);
   std::printf("CALL2_MSG=%s\n", res2.response.c_str());
   std::printf("ELAPSED_MS=%lld\n", static_cast<long long>(elapsed_ms));
-  return (call1_status != static_cast<int>(egrpc::internal::StatusCode::kOk) &&
-          call2_status == static_cast<int>(egrpc::internal::StatusCode::kOk) &&
-          res2.response == "second-ok")
-             ? 0
-             : 1;
+  // libnghttp2 < 1.67 resets only stream 1 (Call 1 fails, Call 2 succeeds);
+  // libnghttp2 >= 1.67 (CVE-2025-8671) terminates the session with GOAWAY
+  // (both calls fail promptly with UNAVAILABLE). Pytest correlates the exact
+  // wire frame (RST_STREAM vs GOAWAY) with the observed call outcomes.
+  const bool stream_reset_ok =
+      call1_status == static_cast<int>(egrpc::internal::StatusCode::kInternal) &&
+      call2_status == static_cast<int>(egrpc::internal::StatusCode::kOk) &&
+      res2.response == "second-ok";
+  const bool conn_terminated_ok =
+      call1_status == static_cast<int>(egrpc::internal::StatusCode::kUnavailable) &&
+      call2_status == static_cast<int>(egrpc::internal::StatusCode::kUnavailable) &&
+      res2.response.empty();
+  return (stream_reset_ok || conn_terminated_ok) ? 0 : 1;
 }
 
 int RunConnErrorNoDeadline(const std::string& host, uint16_t port, const std::string& ca_file) {
