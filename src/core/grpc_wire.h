@@ -82,8 +82,21 @@ class GrpcMessageScanner {
   // complete message is buffered (never a protocol error — see Feed).
   bool Next(std::string* message);
 
-  // True if bytes of an incomplete frame remain buffered.
+  // True if at least one complete message is currently buffered and ready
+  // for Next().
+  bool HasCompleteMessage() const;
+
+  // If a complete message is buffered, writes its framed wire size (5 + payload
+  // length) to *wire_bytes and returns true.
+  bool PeekNextWireBytes(size_t* wire_bytes) const;
+
+  // True if trailing bytes of an incomplete/truncated frame remain buffered
+  // beyond the last complete validated frame.
   bool HasPartialMessage() const;
+
+  // Unconsumed bytes currently retained in the reassembly buffer (both
+  // complete-but-undrained frames and any trailing partial frame).
+  size_t buffered_bytes() const { return buf_.size() - pos_; }
 
   bool failed() const { return failed_; }
   StatusCode error_code() const { return error_code_; }
@@ -91,8 +104,9 @@ class GrpcMessageScanner {
 
  private:
   const size_t max_message_size_;
-  std::string buf_;  // accumulation buffer; [pos_, size) is unconsumed
-  size_t pos_ = 0;   // start of the current (possibly incomplete) frame
+  std::string buf_;           // accumulation buffer; [pos_, size) is unconsumed
+  size_t pos_ = 0;            // start of the next unread frame
+  size_t validated_pos_ = 0;  // end of all already-validated complete frames
   bool failed_ = false;
   StatusCode error_code_ = StatusCode::kOk;
   std::string error_;

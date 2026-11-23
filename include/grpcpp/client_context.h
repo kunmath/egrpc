@@ -1,20 +1,25 @@
-// egrpc grpcpp shim — grpc::ClientContext (design §4.5): deadline, initial
-// metadata, wait_for_ready, TryCancel, and post-call access to server
-// metadata. One context per call, created before and inspected after; it is
-// never touched by the EventThread — grpc::Channel reads it before
-// submitting and writes the results back after CallState::Wait returns, all
-// on the caller's thread (design §3).
+// egrpc grpcpp shim — grpc::ClientContext (design §4.5, §5.7): deadline,
+// initial metadata, wait_for_ready, thread-safe TryCancel, and post-call
+// access to server metadata. Metadata storage is only written on the caller's
+// thread (never the EventThread); TryCancel() is safe from any thread and
+// works both before the RPC starts and mid-flight.
 #pragma once
 
 #include <grpcpp/support/string_ref.h>
 
 #include <chrono>
+#include <functional>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <string>
 
 namespace grpc {
 
 class Channel;
+namespace internal {
+class ClientStreamRawImpl;
+}  // namespace internal
 
 class ClientContext {
  public:
@@ -23,10 +28,10 @@ class ClientContext {
   ClientContext(const ClientContext&) = delete;
   ClientContext& operator=(const ClientContext&) = delete;
 
-  // Absolute deadline; encoded as the grpc-timeout request header (§5.1).
-  // A deadline already in the past fails the call with DEADLINE_EXCEEDED
-  // before anything is sent. TODO(M5): local timer so an unresponsive
-  // server cannot outlive the deadline either.
+  // Absolute deadline; enforced locally by the channel's EventThread timer
+  // (including while queued) and encoded as the grpc-timeout header (§5.1,
+  // §5.6). An already-expired deadline fails immediately with
+  // DEADLINE_EXCEEDED before anything is queued.
   void set_deadline(const std::chrono::system_clock::time_point& deadline) { deadline_ = deadline; }
   std::chrono::system_clock::time_point deadline() const { return deadline_; }
 
@@ -42,12 +47,26 @@ class ClientContext {
   // channel has failed).
   void set_wait_for_ready(bool wait_for_ready) { wait_for_ready_ = wait_for_ready; }
 
-  // TODO(M5): wired to CallState cancellation. No-op until then.
-  void TryCancel() {}
+  // Requests cancellation of this RPC (design §5.6, §5.7). Thread-safe and
+  // idempotent; legal before the call begins or concurrently from another
+  // thread while the call is in flight. Copying the shared_ptr hook under
+  // cancel_mu_ is allocation-free and noexcept.
+  void TryCancel() {
+    std::shared_ptr<std::function<void()>> fn;
+    {
+      std::lock_guard<std::mutex> lock(cancel_mu_);
+      if (cancel_requested_) return;
+      cancel_requested_ = true;
+      fn = cancel_fn_;
+    }
+    if (fn && *fn) (*fn)();
+  }
 
-  // Server metadata, valid once the call has finished. `-bin` values are
-  // base64-decoded. The string_refs point into storage owned by this
-  // context and stay valid for its lifetime.
+  // Server metadata: initial metadata is valid after WaitForInitialMetadata(),
+  // the first Read(), or Finish() / unary return; trailing metadata is valid
+  // after Finish() / unary return. `-bin` values are base64-decoded. The
+  // string_refs point into storage owned by this context and stay valid for
+  // its lifetime.
   const std::multimap<grpc::string_ref, grpc::string_ref>& GetServerInitialMetadata() const {
     return recv_initial_view_;
   }
@@ -56,9 +75,25 @@ class ClientContext {
   }
 
  private:
-  // grpc::Channel is the shim's call driver: it consumes the send side and
-  // deposits the received metadata (building the string_ref views).
+  // grpc::Channel and ClientStreamRawImpl are the shim's call drivers: they
+  // consume the send side, bind TryCancel, and deposit received metadata.
   friend class grpc::Channel;
+  friend class grpc::internal::ClientStreamRawImpl;
+
+  // Binds a cancel action for an in-flight call. Returns true if TryCancel()
+  // was already invoked on this context before the call started.
+  bool BindCancel(std::function<void()> fn) {
+    auto shared_fn = std::make_shared<std::function<void()>>(std::move(fn));
+    std::lock_guard<std::mutex> lock(cancel_mu_);
+    if (cancel_requested_) return true;
+    cancel_fn_ = std::move(shared_fn);
+    return false;
+  }
+
+  void UnbindCancel() {
+    std::lock_guard<std::mutex> lock(cancel_mu_);
+    cancel_fn_.reset();
+  }
 
   std::chrono::system_clock::time_point deadline_ = std::chrono::system_clock::time_point::max();
   bool wait_for_ready_ = false;
@@ -70,6 +105,12 @@ class ClientContext {
   std::multimap<std::string, std::string> recv_trailing_metadata_;
   std::multimap<grpc::string_ref, grpc::string_ref> recv_initial_view_;
   std::multimap<grpc::string_ref, grpc::string_ref> recv_trailing_view_;
+
+  // Leaf lock guarding TryCancel() across caller threads (§5.7). Never held
+  // while invoking *cancel_fn_.
+  std::mutex cancel_mu_;
+  bool cancel_requested_ = false;
+  std::shared_ptr<std::function<void()>> cancel_fn_;
 };
 
 }  // namespace grpc

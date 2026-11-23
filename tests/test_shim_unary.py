@@ -175,18 +175,18 @@ def test_trailing_metadata_exposed_with_bin_decoding(
     assert "TRAILING egrpc-bin-bin=\\x00\\x01" in lines, _fail_msg(result)
 
 
-def test_server_streaming_stub_reports_unimplemented(
+def test_client_and_bidi_streaming_stubs_report_unimplemented(
     shim_bin, certs, route_guide_server
 ):
-    """M4 contract for the M5-pending ClientReader: no messages, UNIMPLEMENTED, no hang."""
+    """Out-of-scope streaming stubs (RecordRoute, RouteChat) return UNIMPLEMENTED."""
     result = _run_client(
         shim_bin, certs, route_guide_server.port,
-        "--mode", "listfeatures",
+        "--mode", "unimplemented_streams",
     )
     assert result.returncode == 0, _fail_msg(result)
-    assert "LISTFEATURES code=12 messages=0" in result.stdout.splitlines(), _fail_msg(
-        result
-    )
+    lines = result.stdout.splitlines()
+    assert "RECORDROUTE code=12 write=0 done=0" in lines, _fail_msg(result)
+    assert "ROUTECHAT code=12 write=0 read=0" in lines, _fail_msg(result)
 
 
 def test_concurrent_unary_calls(shim_bin, certs, route_guide_server):

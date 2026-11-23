@@ -24,3 +24,9 @@ target_link_libraries(route_guide_proto PUBLIC PkgConfig::ProtobufLite)
 add_executable(egrpc_unary_call unary_call_main.cc)
 target_include_directories(egrpc_unary_call PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(egrpc_unary_call PRIVATE egrpc_static route_guide_proto egrpc_warnings)
+
+# M5 probe: server-streaming flow-control / memory high-water probe driven by
+# tests/test_streaming.py.
+add_executable(egrpc_stream_probe stream_probe_main.cc)
+target_include_directories(egrpc_stream_probe PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(egrpc_stream_probe PRIVATE egrpc_static route_guide_proto egrpc_warnings)

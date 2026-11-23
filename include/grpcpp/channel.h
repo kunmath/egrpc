@@ -19,6 +19,7 @@ namespace grpc {
 
 class ClientContext;
 namespace internal {
+class ClientStreamRaw;
 class RpcMethod;
 }  // namespace internal
 
@@ -30,9 +31,14 @@ class Channel final : public ChannelInterface {
   // The funnel BlockingUnaryCall ends in: sends the context's metadata and
   // the serialized request, blocks until the call closes, deposits response
   // metadata back into *context (design §3: the caller thread blocks in
-  // CallState::Wait; the EventThread owns everything else).
+  // CallCompletion::Wait; the EventThread owns everything else).
   Status BlockingUnaryCallShim(const internal::RpcMethod& method, ClientContext* context,
                                const std::string& request, std::string* response);
+
+  // The funnel ClientReaderFactory ends in: starts a server-streaming RPC
+  // and returns the opaque byte-level stream driver.
+  std::unique_ptr<internal::ClientStreamRaw> StartServerStreamShim(
+      const internal::RpcMethod& method, ClientContext* context, const std::string& request);
 
   // Internal factories used by CreateChannel (src/api/create_channel.cc).
   // A "lame" channel has no transport and fails every call with
@@ -42,9 +48,12 @@ class Channel final : public ChannelInterface {
   static std::shared_ptr<Channel> Lame(Status lame_status);
 
  private:
-  Channel(std::unique_ptr<egrpc::internal::ChannelImpl> impl, Status lame_status);
+  Channel(std::shared_ptr<egrpc::internal::ChannelImpl> impl, Status lame_status);
 
-  const std::unique_ptr<egrpc::internal::ChannelImpl> impl_;  // null ⇒ lame
+  // Shared internally with weak_ptrs held by active ClientReaders and
+  // ClientContext TryCancel hooks so readers can safely outlive Channel (§5.7).
+  // ~Channel() explicitly calls impl_->Shutdown().
+  const std::shared_ptr<egrpc::internal::ChannelImpl> impl_;  // null ⇒ lame
   const Status lame_status_;
 };
 

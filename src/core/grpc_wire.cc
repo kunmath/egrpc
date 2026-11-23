@@ -1,6 +1,9 @@
 // egrpc — gRPC wire-format helpers (design §5.1, §5.5). See grpc_wire.h.
 #include "core/grpc_wire.h"
 
+#include <cassert>
+#include <limits>
+
 namespace egrpc {
 namespace internal {
 
@@ -68,6 +71,7 @@ bool ParseGrpcStatus(const std::string& value, StatusCode* code) {
 }
 
 void AppendGrpcFramePrefix(size_t payload_len, std::string* out) {
+  assert(payload_len <= std::numeric_limits<uint32_t>::max());
   const uint32_t len = static_cast<uint32_t>(payload_len);
   const char prefix[5] = {
       0,  // compressed flag: egrpc never compresses (§5.1)
@@ -84,14 +88,14 @@ GrpcMessageScanner::GrpcMessageScanner(size_t max_message_size)
 
 bool GrpcMessageScanner::Feed(const uint8_t* data, size_t len) {
   if (failed_) return false;
-  buf_.append(reinterpret_cast<const char*>(data), len);
+  if (len > 0) {
+    buf_.append(reinterpret_cast<const char*>(data), len);
+  }
 
-  // Validate the prefix of every frame whose 5 header bytes are now present,
-  // so oversize/compressed frames are rejected before their payload is
-  // buffered (the max_message_size bound, design §4.3). The oversize check
-  // also keeps `5 + msg_len` below any wrap on 32-bit size_t, provided
-  // max_message_size is a sane bound (callers pass ≤ 4 MiB defaults).
-  size_t offset = pos_;
+  // Validate prefixes starting from validated_pos_ (never rescanning complete
+  // frames already validated on earlier chunks), so oversize/compressed frames
+  // are rejected before their payload is buffered in O(N) total time.
+  size_t offset = (validated_pos_ > pos_) ? validated_pos_ : pos_;
   while (buf_.size() - offset >= 5) {
     const uint8_t flag = static_cast<uint8_t>(buf_[offset]);
     const uint32_t msg_len = ReadBigEndian32(buf_.data() + offset + 1);
@@ -115,9 +119,10 @@ bool GrpcMessageScanner::Feed(const uint8_t* data, size_t len) {
                ")";
       return false;
     }
-    if (buf_.size() - offset < 5 + static_cast<size_t>(msg_len)) break;
+    if (buf_.size() - offset - 5 < static_cast<size_t>(msg_len)) break;
     offset += 5 + static_cast<size_t>(msg_len);
   }
+  validated_pos_ = offset;
   return true;
 }
 
@@ -126,22 +131,42 @@ bool GrpcMessageScanner::Next(std::string* message) {
   const size_t available = buf_.size() - pos_;
   if (available < 5) return false;
   const uint32_t msg_len = ReadBigEndian32(buf_.data() + pos_ + 1);
-  if (available < 5 + static_cast<size_t>(msg_len)) return false;
+  if (available - 5 < static_cast<size_t>(msg_len)) return false;
 
   message->assign(buf_, pos_ + 5, msg_len);
   pos_ += 5 + static_cast<size_t>(msg_len);
+  if (validated_pos_ < pos_) validated_pos_ = pos_;
 
   if (pos_ == buf_.size()) {
     buf_.clear();
     pos_ = 0;
+    validated_pos_ = 0;
   } else if (pos_ >= 65536 && pos_ >= buf_.size() / 2) {
     buf_.erase(0, pos_);
+    validated_pos_ = (validated_pos_ > pos_) ? (validated_pos_ - pos_) : 0;
     pos_ = 0;
   }
   return true;
 }
 
-bool GrpcMessageScanner::HasPartialMessage() const { return buf_.size() > pos_; }
+bool GrpcMessageScanner::HasCompleteMessage() const {
+  size_t wire_bytes = 0;
+  return PeekNextWireBytes(&wire_bytes);
+}
+
+bool GrpcMessageScanner::PeekNextWireBytes(size_t* wire_bytes) const {
+  if (failed_) return false;
+  const size_t available = buf_.size() - pos_;
+  if (available < 5) return false;
+  const uint32_t msg_len = ReadBigEndian32(buf_.data() + pos_ + 1);
+  if (available - 5 < static_cast<size_t>(msg_len)) return false;
+  *wire_bytes = 5 + static_cast<size_t>(msg_len);
+  return true;
+}
+
+bool GrpcMessageScanner::HasPartialMessage() const {
+  return !failed_ && buf_.size() > validated_pos_;
+}
 
 std::string EncodeGrpcTimeout(std::chrono::nanoseconds timeout) {
   int64_t ns = timeout.count();
@@ -213,7 +238,11 @@ std::string Base64Encode(const std::string& in) {
 bool Base64Decode(const std::string& in, std::string* out) {
   // Accept padded and unpadded input: strip up to two trailing '='.
   size_t len = in.size();
-  while (len > 0 && in[len - 1] == '=') --len;
+  int pad = 0;
+  while (len > 0 && pad < 2 && in[len - 1] == '=') {
+    --len;
+    ++pad;
+  }
   if (len % 4 == 1) return false;  // impossible base64 length
 
   out->clear();

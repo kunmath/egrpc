@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
 
@@ -24,29 +25,61 @@ struct Http2Session::Impl {
                          void* user_data) {
     auto* self = static_cast<Http2Session*>(user_data);
     switch (frame->hd.type) {
+      case NGHTTP2_DATA: {
+        Stream* stream = FindStream(self, frame->hd.stream_id);
+        if (stream == nullptr) break;
+        // Even with no_auto_window_update=1, nghttp2 accounts for DATA padding
+        // internally, but only flushes WINDOW_UPDATE once its threshold is
+        // crossed. Re-check FlushManualStreamCredit so padding on a tight
+        // window can never deadlock the first legal max-size message.
+        if (frame->data.padlen > 0 && stream->manual_flow_control) {
+          self->FlushManualStreamCredit(stream, frame->hd.stream_id);
+        }
+        if ((frame->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0 &&
+            stream->hooks.on_response_end_stream) {
+          stream->hooks.on_response_end_stream();
+        }
+        break;
+      }
       case NGHTTP2_HEADERS: {
         Stream* stream = FindStream(self, frame->hd.stream_id);
         if (stream == nullptr) break;
         HeaderList headers = std::move(stream->pending_headers);
         stream->pending_headers.clear();
-        // HCAT_RESPONSE is the first (initial) response HEADERS; anything
-        // later on the stream is trailers. Trailers-Only responses arrive as
-        // HCAT_RESPONSE with END_STREAM (design §4.3).
-        if (frame->headers.cat == NGHTTP2_HCAT_RESPONSE) {
-          const bool end_stream = (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0;
+        const bool end_stream = (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0;
+        // Informational 1xx responses arrive as HCAT_RESPONSE; nghttp2 then
+        // delivers the final response (e.g. 200) as HCAT_HEADERS. Ignore 1xx
+        // blocks and route the first non-1xx block to on_response_headers.
+        if (frame->headers.cat == NGHTTP2_HCAT_RESPONSE ||
+            (!stream->final_response_headers_seen && frame->headers.cat == NGHTTP2_HCAT_HEADERS)) {
+          int status = 0;
+          for (const auto& h : headers) {
+            if (h.first == ":status") {
+              status = std::atoi(h.second.c_str());
+              break;
+            }
+          }
+          if (status >= 100 && status < 200 && !end_stream) {
+            break;
+          }
+          stream->final_response_headers_seen = true;
           if (stream->hooks.on_response_headers) {
             stream->hooks.on_response_headers(std::move(headers), end_stream);
           }
         } else if (stream->hooks.on_trailers) {
           stream->hooks.on_trailers(std::move(headers));
         }
+        if (end_stream && stream->hooks.on_response_end_stream) {
+          stream->hooks.on_response_end_stream();
+        }
         break;
       }
       case NGHTTP2_SETTINGS:
         if (frame->hd.flags & NGHTTP2_FLAG_ACK) {
           if (self->hooks_.on_settings_ack) self->hooks_.on_settings_ack();
-        } else if (self->hooks_.on_remote_settings) {
-          self->hooks_.on_remote_settings();
+        } else {
+          self->remote_settings_received_ = true;
+          if (self->hooks_.on_remote_settings) self->hooks_.on_remote_settings();
         }
         break;
       case NGHTTP2_PING:
@@ -89,11 +122,29 @@ struct Http2Session::Impl {
     return 0;
   }
 
-  static int OnDataChunkRecv(nghttp2_session* /*session*/, uint8_t /*flags*/, int32_t stream_id,
+  static int OnDataChunkRecv(nghttp2_session* session, uint8_t /*flags*/, int32_t stream_id,
                              const uint8_t* data, size_t len, void* user_data) {
     auto* self = static_cast<Http2Session*>(user_data);
+    // Connection-level credit is always returned immediately (§5.4) so a
+    // slow/stalled stream never starves sibling streams or leaks window on a
+    // recently-reset stream.
+    if (len > 0) {
+      nghttp2_session_consume_connection(session, len);
+    }
     Stream* stream = FindStream(self, stream_id);
-    if (stream != nullptr && stream->hooks.on_data) stream->hooks.on_data(data, len);
+    if (stream == nullptr) return 0;
+    if (!stream->manual_flow_control && len > 0) {
+      nghttp2_session_consume_stream(session, stream_id, len);
+    } else if (stream->manual_flow_control) {
+      stream->unconsumed_payload_bytes += len;
+    }
+    if (stream->hooks.on_data) stream->hooks.on_data(data, len);
+    // For manual-flow streams, if prior Read()s or padding already freed
+    // credit and this chunk pushed remaining peer window to half or less,
+    // flush all eligible credit so a following max-size message cannot stall.
+    if (stream->manual_flow_control) {
+      self->FlushManualStreamCredit(stream, stream_id);
+    }
     return 0;
   }
 
@@ -138,10 +189,22 @@ Http2Session::Http2Session(const Http2SessionOptions& options, Hooks hooks, Time
   nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks, &Impl::OnDataChunkRecv);
   nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, &Impl::OnStreamClose);
 
-  const int new_rc = nghttp2_session_client_new(&session_, callbacks, this);
+  // Disable automatic WINDOW_UPDATE globally (§5.4): connection credit and
+  // unary stream credit are returned explicitly on DATA receipt, while
+  // server-streaming streams return stream credit only via ConsumeStream().
+  nghttp2_option* ng_opt = nullptr;
+  if (nghttp2_option_new(&ng_opt) != 0) {
+    nghttp2_session_callbacks_del(callbacks);
+    error_ = "nghttp2_option_new failed";
+    return;
+  }
+  nghttp2_option_set_no_auto_window_update(ng_opt, 1);
+
+  const int new_rc = nghttp2_session_client_new2(&session_, callbacks, this, ng_opt);
+  nghttp2_option_del(ng_opt);
   nghttp2_session_callbacks_del(callbacks);
   if (new_rc != 0) {
-    error_ = std::string("nghttp2_session_client_new failed: ") + nghttp2_strerror(new_rc);
+    error_ = std::string("nghttp2_session_client_new2 failed: ") + nghttp2_strerror(new_rc);
     session_ = nullptr;
     return;
   }
@@ -161,14 +224,16 @@ Http2Session::Http2Session(const Http2SessionOptions& options, Hooks hooks, Time
     return;
   }
 
-  // Raise the connection-level (stream 0) receive window to match the stream
-  // window; nghttp2 emits the WINDOW_UPDATE into the output buffer (§5.4).
-  // SETTINGS_INITIAL_WINDOW_SIZE caps at 2^31-1; clamp so a future
-  // user-supplied value cannot go negative through the cast.
-  const int32_t window = static_cast<int32_t>(
+  // Raise the connection-level (stream 0) receive window to at least
+  // initial_window_size (and at least the RFC 7540 65535 initial window so
+  // small test stream windows never under-size the connection window).
+  // SETTINGS_INITIAL_WINDOW_SIZE caps at 2^31-1; clamp so a user-supplied
+  // value cannot go negative through the cast.
+  const int32_t stream_window = static_cast<int32_t>(
       std::min<uint32_t>(options_.initial_window_size, static_cast<uint32_t>(INT32_MAX)));
+  const int32_t conn_window = std::max<int32_t>(stream_window, 65535);
   const int window_rc =
-      nghttp2_session_set_local_window_size(session_, NGHTTP2_FLAG_NONE, 0, window);
+      nghttp2_session_set_local_window_size(session_, NGHTTP2_FLAG_NONE, 0, conn_window);
   if (window_rc != 0) {
     error_ =
         std::string("nghttp2_session_set_local_window_size failed: ") + nghttp2_strerror(window_rc);
@@ -197,18 +262,32 @@ bool Http2Session::ReceiveBytes(TimePoint now, const uint8_t* data, size_t len) 
 
 int32_t Http2Session::SubmitUnaryRequest(const HeaderList& headers, std::string body,
                                          StreamHooks hooks) {
+  return SubmitRequest(headers, std::move(body), std::move(hooks),
+                       /*manual_flow_control=*/false);
+}
+
+int32_t Http2Session::SubmitServerStreamRequest(const HeaderList& headers, std::string body,
+                                                StreamHooks hooks) {
+  return SubmitRequest(headers, std::move(body), std::move(hooks),
+                       /*manual_flow_control=*/true);
+}
+
+int32_t Http2Session::SubmitRequest(const HeaderList& headers, std::string body, StreamHooks hooks,
+                                    bool manual_flow_control) {
+  call_error_.clear();
   if (session_ == nullptr) {
-    error_ = "session not initialized";
+    call_error_ = "session not initialized";
     return -1;
   }
   if (draining_) {
-    error_ = "session is draining (GOAWAY received); no new streams";
+    call_error_ = "session is draining (GOAWAY received); no new streams";
     return -1;
   }
 
   auto stream = std::make_unique<Stream>();
   stream->hooks = std::move(hooks);
   stream->body = std::move(body);
+  stream->manual_flow_control = manual_flow_control;
 
   // nghttp2_nv wants non-const pointers but copies names and values during
   // submit (no NO_COPY flags set), so the casts do not outlive this call.
@@ -227,12 +306,65 @@ int32_t Http2Session::SubmitUnaryRequest(const HeaderList& headers, std::string 
   const int32_t stream_id =
       nghttp2_submit_request(session_, nullptr, nva.data(), nva.size(), &provider, nullptr);
   if (stream_id < 0) {
-    error_ = std::string("nghttp2_submit_request failed: ") + nghttp2_strerror(stream_id);
+    call_error_ = std::string("nghttp2_submit_request failed: ") + nghttp2_strerror(stream_id);
     return -1;
   }
   streams_.emplace(stream_id, std::move(stream));
   ++active_streams_;
   return stream_id;
+}
+
+void Http2Session::ConsumeStream(int32_t stream_id, size_t bytes) {
+  if (session_ == nullptr || bytes == 0) return;
+  Stream* stream = Impl::FindStream(this, stream_id);
+  if (stream == nullptr || !stream->manual_flow_control) return;
+  stream->unconsumed_payload_bytes -= std::min(bytes, stream->unconsumed_payload_bytes);
+  FlushManualStreamCredit(stream, stream_id);
+}
+
+void Http2Session::FlushManualStreamCredit(Stream* stream, int32_t stream_id) {
+  if (session_ == nullptr || !stream->manual_flow_control) return;
+  const int32_t effective_local =
+      nghttp2_session_get_stream_effective_local_window_size(session_, stream_id);
+  const int32_t recv_len =
+      nghttp2_session_get_stream_effective_recv_data_length(session_, stream_id);
+  const int32_t remaining = nghttp2_session_get_stream_local_window_size(session_, stream_id);
+  if (effective_local <= 0 || recv_len <= 0 || remaining < 0) return;
+
+  // recv_len is nghttp2's exact count of unacknowledged flow-controlled bytes
+  // on the stream (held payload + popped payload + unacked padding).
+  // Subtracting unconsumed_payload_bytes yields the exact credit eligible to
+  // return (popped payload + padding) with zero drift, leak, or double-credit,
+  // even when nghttp2 auto-flushes padding on its own.
+  if (static_cast<size_t>(recv_len) <= stream->unconsumed_payload_bytes) return;
+  const size_t available_credit = static_cast<size_t>(recv_len) - stream->unconsumed_payload_bytes;
+
+  // Batch small reads/padding up to half the stream window, but flush
+  // immediately whenever remaining peer window is at or below half so neither
+  // small consumed messages nor padding can strand credit needed by a legal
+  // max-size message.
+  const int32_t half_window = std::max<int32_t>(1, effective_local / 2);
+  if (available_credit < static_cast<size_t>(half_window) && remaining > half_window) {
+    return;
+  }
+
+  const int32_t to_send =
+      static_cast<int32_t>(std::min<size_t>(available_credit, static_cast<size_t>(INT32_MAX)));
+  if (to_send > 0) {
+    nghttp2_submit_window_update(session_, NGHTTP2_FLAG_NONE, stream_id, to_send);
+  }
+}
+
+bool Http2Session::ResetStream(int32_t stream_id, uint32_t error_code) {
+  call_error_.clear();
+  if (session_ == nullptr || stream_id <= 0) return false;
+  if (Impl::FindStream(this, stream_id) == nullptr) return true;
+  const int rc = nghttp2_submit_rst_stream(session_, NGHTTP2_FLAG_NONE, stream_id, error_code);
+  if (rc != 0) {
+    call_error_ = std::string("nghttp2_submit_rst_stream failed: ") + nghttp2_strerror(rc);
+    return false;
+  }
+  return true;
 }
 
 uint32_t Http2Session::remote_max_concurrent_streams() const {
@@ -278,6 +410,17 @@ void Http2Session::ConsumeOutput(size_t n) {
 bool Http2Session::WantWrite() {
   if (out_consumed_ < out_.size()) return true;
   return session_ != nullptr && nghttp2_session_want_write(session_) != 0;
+}
+
+bool Http2Session::WantRead() const {
+  return session_ != nullptr &&
+         nghttp2_session_want_read(const_cast<nghttp2_session*>(session_)) != 0;
+}
+
+bool Http2Session::IsStreamLocalOpen(int32_t stream_id) const {
+  if (session_ == nullptr || stream_id <= 0) return false;
+  return nghttp2_session_get_stream_local_close(const_cast<nghttp2_session*>(session_),
+                                                stream_id) == 0;
 }
 
 std::optional<Http2Session::TimePoint> Http2Session::NextKeepaliveDeadline(
