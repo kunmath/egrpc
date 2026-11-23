@@ -128,7 +128,9 @@ class ClientStreamRawImpl final : public ClientStreamRaw {
     assert(!finished_ && !read_started_ &&
            "WaitForInitialMetadata() is only legal before the first Read()");
     if (lame_status_.has_value() || !completion_) return;
-    completion_->WaitForInitialMetadata();
+    if (completion_->WaitForInitialMetadata() && context_ != nullptr) {
+      context_->egrpc_initial_metadata_received_ = true;
+    }
     EnsureInitialMetadataDeposited();
   }
 
@@ -224,6 +226,7 @@ class ClientStreamRawImpl final : public ClientStreamRaw {
  private:
   void EnsureInitialMetadataDeposited() {
     if (initial_metadata_deposited_ || context_ == nullptr || !completion_) return;
+    if (completion_->initial_metadata_received()) context_->egrpc_initial_metadata_received_ = true;
     DepositMetadata(completion_->InitialMetadataCopy(), &context_->recv_initial_metadata_,
                     &context_->recv_initial_view_);
     initial_metadata_deposited_ = true;

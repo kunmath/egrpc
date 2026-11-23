@@ -105,7 +105,9 @@ class CallCompletion {
   // --- Caller thread methods ------------------------------------------------
   // Blocks until initial response headers arrive or the call reaches CLOSED
   // (e.g. Trailers-Only or local failure).
-  void WaitForInitialMetadata();
+  // Returns true iff valid initial metadata arrived before the call closed.
+  bool WaitForInitialMetadata();
+  bool initial_metadata_received() const;
   // Snapshot of initial metadata (call after WaitForInitialMetadata/PopMessage/Wait).
   Http2Session::HeaderList InitialMetadataCopy() const;
 

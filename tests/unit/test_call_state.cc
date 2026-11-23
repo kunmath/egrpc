@@ -962,4 +962,60 @@ TEST_SUITE("call_state") {
       CHECK(r.origin == StatusOrigin::kLocal);
     }
   }
+
+  TEST_CASE("Initial metadata arrival: valid headers with zero custom metadata") {
+    auto completion = std::make_shared<CallCompletion>();
+    CallState call(kMax, CallMode::kServerStreaming, completion, 16, kMax);
+    CHECK_FALSE(completion->initial_metadata_received());
+    call.OnResponseHeaders({{":status", "200"}, {"content-type", "application/grpc"}},
+                           /*end_stream=*/false);
+    CHECK(completion->initial_metadata_received());
+    call.OnClose(0);
+    CHECK(completion->WaitForInitialMetadata());
+    CHECK(completion->initial_metadata_received());
+  }
+
+  TEST_CASE("Initial metadata arrival: Trailers-Only does not count") {
+    auto completion = std::make_shared<CallCompletion>();
+    CallState call(kMax, CallMode::kServerStreaming, completion, 16, kMax);
+    call.OnResponseHeaders(
+        {{":status", "200"}, {"content-type", "application/grpc"}, {"grpc-status", "14"}},
+        /*end_stream=*/true);
+    call.OnClose(0);
+    CHECK_FALSE(completion->WaitForInitialMetadata());
+    CHECK_FALSE(completion->initial_metadata_received());
+  }
+
+  TEST_CASE("Initial metadata arrival: non-200 HTTP response does not count") {
+    auto completion = std::make_shared<CallCompletion>();
+    CallState call(kMax, CallMode::kServerStreaming, completion, 16, kMax);
+    call.OnResponseHeaders({{":status", "502"}, {"content-type", "text/html"}},
+                           /*end_stream=*/false);
+    CHECK_FALSE(completion->initial_metadata_received());
+    FeedData(&call, "<html>502 Bad Gateway</html>");
+    call.OnClose(0);
+    CHECK_FALSE(completion->WaitForInitialMetadata());
+    CHECK_FALSE(completion->initial_metadata_received());
+    CHECK(completion->Wait().code == StatusCode::kUnavailable);
+  }
+
+  TEST_CASE("Initial metadata arrival: non-gRPC content-type does not count") {
+    auto completion = std::make_shared<CallCompletion>();
+    CallState call(kMax, CallMode::kServerStreaming, completion, 16, kMax);
+    call.OnResponseHeaders({{":status", "200"}, {"content-type", "text/plain"}},
+                           /*end_stream=*/false);
+    CHECK_FALSE(completion->initial_metadata_received());
+    call.OnClose(0);
+    CHECK_FALSE(completion->WaitForInitialMetadata());
+    CHECK_FALSE(completion->initial_metadata_received());
+    CHECK(completion->Wait().code == StatusCode::kInternal);
+  }
+
+  TEST_CASE("Initial metadata arrival: FailLocal before headers") {
+    auto completion = std::make_shared<CallCompletion>();
+    CallState call(kMax, CallMode::kServerStreaming, completion, 16, kMax);
+    call.FailLocal(StatusCode::kCancelled, "Cancelled");
+    CHECK_FALSE(completion->WaitForInitialMetadata());
+    CHECK_FALSE(completion->initial_metadata_received());
+  }
 }  // TEST_SUITE("call_state")

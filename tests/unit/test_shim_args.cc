@@ -72,6 +72,14 @@ TEST_SUITE("shim_args") {
     CHECK_FALSE(ctx.egrpc_status_is_local());
   }
 
+  TEST_CASE("ClientContext egrpc_initial_metadata_received defaults to false and is markable") {
+    grpc::ClientContext ctx;
+    CHECK_FALSE(ctx.egrpc_initial_metadata_received());
+    grpc::internal::ClientContextAccess::MarkInitialMetadataReceived(nullptr);
+    grpc::internal::ClientContextAccess::MarkInitialMetadataReceived(&ctx);
+    CHECK(ctx.egrpc_initial_metadata_received());
+  }
+
   TEST_CASE("ChannelArguments M6 keys use upstream channel-arg names") {
     CHECK(std::string(GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS) ==
           "grpc.initial_reconnect_backoff_ms");
@@ -154,6 +162,7 @@ TEST_SUITE("shim_args") {
         grpc::internal::StartServerStreamRaw(channel.get(), kStreamMethod, &ctx, "request-bytes");
     REQUIRE(raw != nullptr);
     raw->WaitForInitialMetadata();  // must not block on a never-started call
+    CHECK_FALSE(ctx.egrpc_initial_metadata_received());
 
     std::string msg = "untouched";
     CHECK_FALSE(raw->ReadRaw(&msg));

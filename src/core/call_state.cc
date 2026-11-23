@@ -92,9 +92,15 @@ bool CallCompletion::cancel_requested() const {
   return cancel_requested_;
 }
 
-void CallCompletion::WaitForInitialMetadata() {
+bool CallCompletion::WaitForInitialMetadata() {
   std::unique_lock<std::mutex> lock(mu_);
   cv_.wait(lock, [this] { return initial_metadata_ready_ || done_; });
+  return initial_metadata_ready_;
+}
+
+bool CallCompletion::initial_metadata_received() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return initial_metadata_ready_;
 }
 
 Http2Session::HeaderList CallCompletion::InitialMetadataCopy() const {
@@ -219,7 +225,7 @@ void CallState::OnResponseHeaders(Http2Session::HeaderList headers, bool end_str
     }
     metadata.emplace_back(std::move(h));
   }
-  if (!end_stream) {
+  if (!end_stream && http_status_ == 200 && IsGrpcContentType(content_type_)) {
     completion_->DeliverInitialMetadata(std::move(initial_metadata));
   }
   // Final status is computed at OnClose, which nghttp2 fires right after an
