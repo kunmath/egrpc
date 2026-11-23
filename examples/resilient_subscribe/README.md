@@ -24,6 +24,7 @@ opts.on_reconnected = [&] {
 
 egrpc::resilient_stream<routeguide::Feature> cmds(opts, [&](grpc::ClientContext& ctx) {
   routeguide::Rectangle req;
+  req.mutable_lo()->set_latitude(7);        // test server: resumable subscribe mode
   req.mutable_lo()->set_longitude(cursor);  // resume after the cursor
   return stub->ListFeatures(&ctx, req);
 });

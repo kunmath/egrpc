@@ -34,11 +34,15 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <thread>
@@ -85,7 +89,13 @@ bool ParseArgs(int argc, char** argv, Args* a) {
     auto next_long = [&](long* out) {
       std::string v;
       if (!next(&v)) return false;
-      *out = std::strtol(v.c_str(), nullptr, 10);
+      errno = 0;
+      char* end = nullptr;
+      const long n = std::strtol(v.c_str(), &end, 10);
+      if (errno != 0 || end == v.c_str() || *end != '\0' || n < INT32_MIN || n > INT32_MAX) {
+        return false;
+      }
+      *out = n;
       return true;
     };
     long port = 0;
@@ -144,7 +154,7 @@ bool ParseArgs(int argc, char** argv, Args* a) {
       return false;
     }
     if (!ok) {
-      std::fprintf(stderr, "missing value for %s\n", k.c_str());
+      std::fprintf(stderr, "missing or invalid value for %s\n", k.c_str());
       return false;
     }
   }
@@ -170,6 +180,18 @@ egrpc::ChannelConfig MakeConfig(const Args& a) {
   if (a.keepalive_timeout_ms >= 0) cfg.keepalive_timeout = milliseconds(a.keepalive_timeout_ms);
   return cfg;
 }
+
+// Bounded in-memory log capture. The sink may run on a channel's EventThread,
+// so it only takes a short lock and never touches stdio; overflow is dropped.
+struct CapturedLog {
+  egrpc::LogLevel level;
+  std::string component;
+  std::string message;
+};
+constexpr size_t kMaxCapturedLogs = 256;
+std::mutex g_log_mu;
+std::deque<CapturedLog> g_logs;
+size_t g_logs_dropped = 0;
 
 std::string Target(const Args& a) { return a.host + ":" + std::to_string(a.port); }
 
@@ -326,10 +348,13 @@ int main(int argc, char** argv) {
   if (!ParseArgs(argc, argv, &a)) return 2;
 
   if (a.capture_logs) {
-    // Sinks may run on a channel's EventThread: keep them short and
-    // non-blocking (one printf per line is atomic on a line-buffered stream).
     egrpc::SetLogSink([](egrpc::LogLevel level, const char* comp, const std::string& msg) {
-      std::printf("LOG level=%s comp=%s msg=%s\n", egrpc::LogLevelName(level), comp, msg.c_str());
+      std::lock_guard<std::mutex> lock(g_log_mu);
+      if (g_logs.size() >= kMaxCapturedLogs) {
+        ++g_logs_dropped;
+        return;
+      }
+      g_logs.push_back(CapturedLog{level, comp, msg});
     });
   }
 
@@ -344,7 +369,17 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "unknown mode: %s\n", a.mode.c_str());
     return 2;
   }
-  if (a.capture_logs) egrpc::SetLogSink(nullptr);
+  if (a.capture_logs) {
+    // Every channel is destroyed by now (its EventThread joined), so no sink
+    // call can race with this drain.
+    egrpc::SetLogSink(nullptr);
+    std::lock_guard<std::mutex> lock(g_log_mu);
+    for (const CapturedLog& l : g_logs) {
+      std::printf("LOG level=%s comp=%s msg=%s\n", egrpc::LogLevelName(l.level),
+                  l.component.c_str(), l.message.c_str());
+    }
+    std::printf("LOGS_DROPPED=%zu\n", g_logs_dropped);
+  }
   if (rc == 0) std::printf("DONE=1\n");
   return rc;
 }
