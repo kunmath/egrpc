@@ -27,8 +27,9 @@ struct Script {
   std::vector<std::string> msgs;
   Status final_status{StatusCode::UNAVAILABLE, "drop"};
   bool local = false;
-  bool block_in_wait = false;  // WaitForInitialMetadata blocks until cancel
-  bool block_in_read = false;  // after msgs, Read blocks until cancel
+  bool block_in_wait = false;        // WaitForInitialMetadata blocks until cancel
+  bool block_in_read = false;        // after msgs, Read blocks until cancel
+  bool read_ignores_cancel = false;  // buffered msgs stay readable after cancel
 };
 
 class FakeClientReader : public grpc::ClientReaderInterface<std::string> {
@@ -51,7 +52,7 @@ class FakeClientReader : public grpc::ClientReaderInterface<std::string> {
   }
 
   bool Read(std::string* msg) override {
-    if (!s_.metadata || Cancelled()) return false;
+    if (!s_.metadata || (Cancelled() && !s_.read_ignores_cancel)) return false;
     if (next_ < s_.msgs.size()) {
       *msg = s_.msgs[next_++];
       return true;
@@ -674,5 +675,29 @@ TEST_SUITE("resilient_stream") {
     // Without reset the second retry would wait 10 s.
     CHECK(Drain(rs) == std::vector<std::string>{"a", "b"});
     CHECK(Clock::now() - start < std::chrono::milliseconds(2000));
+  }
+
+  TEST_CASE("stop guard precedes Read on reader that ignores cancel") {
+    Harness h;
+    Script sc = Msgs({"a", "b", "c"});
+    sc.read_ignores_cancel = true;
+    h.scripts = {sc};
+    egrpc::resilient_stream<std::string> rs(FastOpts(), h.factory());
+    std::string m;
+    REQUIRE(rs.Read(&m));
+    rs.stop();
+    CHECK_FALSE(rs.Read(&m));
+    CHECK(m == "a");
+    CHECK(rs.status().error_code() == StatusCode::CANCELLED);
+  }
+
+  TEST_CASE("retry_reset_threshold max never resets and does not overflow") {
+    Harness h;
+    h.scripts = {Msgs({"a"}), Msgs({"b"}, kTerminal)};
+    auto o = FastOpts();
+    o.retry_reset_threshold = std::chrono::milliseconds::max();
+    egrpc::resilient_stream<std::string> rs(o, h.factory());
+    CHECK(Drain(rs) == std::vector<std::string>{"a", "b"});
+    CHECK(rs.status().error_code() == StatusCode::UNIMPLEMENTED);
   }
 }

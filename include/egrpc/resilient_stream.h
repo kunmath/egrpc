@@ -228,7 +228,8 @@ class resilient_stream {
       if (!retry) return FinishWith(s);
 
       if (has_established_at_) {
-        if (std::chrono::steady_clock::now() - attempt_established_at_ >=
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+                                                                  attempt_established_at_) >=
             options_.retry_reset_threshold) {
           backoff_.Reset();
         }
@@ -331,6 +332,8 @@ class resilient_stream {
 
   bool FinishWith(grpc::Status s) {
     std::lock_guard<std::mutex> lock(mu_);
+    // Checked under the publishing lock so stop() always wins with CANCELLED.
+    if (stopped_ && s.error_code() != grpc::StatusCode::CANCELLED) s = Cancelled();
     terminal_status_ = std::move(s);
     finished_ = true;
     return false;
