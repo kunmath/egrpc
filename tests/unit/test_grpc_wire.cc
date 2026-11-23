@@ -225,6 +225,111 @@ TEST_SUITE("grpc_wire") {
     CHECK(msg == payload);
   }
 
+  TEST_CASE("Scanner: HasCompleteMessage and buffered_bytes track accumulation and drain") {
+    const std::string first = Frame("hello");  // 5-byte prefix + 5-byte payload = 10 bytes
+    const std::string second = Frame("ab");    // 5-byte prefix + 2-byte payload = 7 bytes
+    GrpcMessageScanner s(kMax);
+
+    CHECK_FALSE(s.HasCompleteMessage());
+    CHECK(s.buffered_bytes() == 0);
+
+    // Feed first 3 bytes of 5-byte prefix.
+    REQUIRE(Feed(&s, first.substr(0, 3)));
+    CHECK_FALSE(s.HasCompleteMessage());
+    CHECK(s.buffered_bytes() == 3);
+
+    // Feed remaining 2 prefix bytes + 2 of 5 payload bytes.
+    REQUIRE(Feed(&s, first.substr(3, 4)));
+    CHECK_FALSE(s.HasCompleteMessage());
+    CHECK(s.buffered_bytes() == 7);
+
+    // Feed remaining 3 payload bytes + full second message "ab" (7 bytes).
+    REQUIRE(Feed(&s, first.substr(7) + second));
+    CHECK(s.HasCompleteMessage());
+    CHECK(s.buffered_bytes() == 17);
+
+    // Pop first message via Next(): second complete message remains buffered.
+    std::string msg;
+    REQUIRE(s.Next(&msg));
+    CHECK(msg == "hello");
+    CHECK(s.HasCompleteMessage());
+    CHECK(s.buffered_bytes() == 7);
+
+    // Pop second message via Next(): buffer is now empty.
+    REQUIRE(s.Next(&msg));
+    CHECK(msg == "ab");
+    CHECK_FALSE(s.HasCompleteMessage());
+    CHECK(s.buffered_bytes() == 0);
+    CHECK_FALSE(s.HasPartialMessage());
+  }
+
+  TEST_CASE("Scanner: PeekNextWireBytes and HasPartialMessage with queued complete frames") {
+    GrpcMessageScanner s(kMax);
+    size_t wb = 0;
+
+    CHECK_FALSE(s.HasCompleteMessage());
+    CHECK_FALSE(s.PeekNextWireBytes(&wb));
+    CHECK_FALSE(s.HasPartialMessage());
+
+    // Feed 2 complete frames ("hello" = 10 wire bytes, "world!" = 11 wire bytes)
+    // with no trailing bytes.
+    REQUIRE(Feed(&s, Frame("hello") + Frame("world!")));
+    CHECK(s.HasCompleteMessage());
+    CHECK(s.PeekNextWireBytes(&wb));
+    CHECK(wb == 10u);
+    CHECK_FALSE(s.HasPartialMessage());
+
+    // Feed 3 bytes of a truncated 3rd frame.
+    const std::string truncated = Frame("third").substr(0, 3);
+    REQUIRE(Feed(&s, truncated));
+    CHECK(s.HasPartialMessage());
+    CHECK(s.PeekNextWireBytes(&wb));
+    CHECK(wb == 10u);
+
+    // Drain frame 1 ("hello"); frame 2 (11 wire bytes) and trailing partial remain.
+    std::string msg;
+    REQUIRE(s.Next(&msg));
+    CHECK(msg == "hello");
+    CHECK(s.PeekNextWireBytes(&wb));
+    CHECK(wb == 11u);
+    CHECK(s.HasPartialMessage());
+
+    // Drain frame 2 ("world!"); only the 3-byte truncated 3rd frame remains.
+    REQUIRE(s.Next(&msg));
+    CHECK(msg == "world!");
+    CHECK_FALSE(s.HasCompleteMessage());
+    CHECK_FALSE(s.PeekNextWireBytes(&wb));
+    CHECK(s.HasPartialMessage());
+  }
+
+  TEST_CASE("Scanner: Linear-time Feed across many queued small frames") {
+    constexpr int kCount = 5000;
+    GrpcMessageScanner s(kMax);
+
+    for (int i = 0; i < kCount; ++i) {
+      const std::string payload(1, static_cast<char>(i & 0xff));
+      const std::string wire = Frame(payload);
+      REQUIRE(wire.size() == 6u);
+      REQUIRE(Feed(&s, wire));
+    }
+
+    CHECK(s.HasCompleteMessage());
+    CHECK_FALSE(s.HasPartialMessage());
+    CHECK(s.buffered_bytes() == static_cast<size_t>(kCount) * 6u);
+
+    std::string msg;
+    for (int i = 0; i < kCount; ++i) {
+      REQUIRE(s.Next(&msg));
+      REQUIRE(msg.size() == 1u);
+      CHECK(static_cast<uint8_t>(msg[0]) == static_cast<uint8_t>(i & 0xff));
+    }
+
+    CHECK_FALSE(s.Next(&msg));
+    CHECK_FALSE(s.HasCompleteMessage());
+    CHECK_FALSE(s.HasPartialMessage());
+    CHECK(s.buffered_bytes() == 0u);
+  }
+
   // --- EncodeGrpcTimeout ------------------------------------------------------
 
   TEST_CASE("EncodeGrpcTimeout: non-positive timeouts encode as 1n") {
@@ -329,6 +434,21 @@ TEST_SUITE("grpc_wire") {
     CHECK_FALSE(Base64Decode("Z", &out));     // len%4==1
     CHECK_FALSE(Base64Decode("Zg=a", &out));  // '=' mid-string
     CHECK_FALSE(Base64Decode("a!b", &out));   // '!' not in alphabet
+  }
+
+  TEST_CASE("Base64Decode: rejects over-padded inputs and accepts valid 0/1/2 padding") {
+    std::string out;
+    CHECK_FALSE(Base64Decode("A===", &out));
+    CHECK_FALSE(Base64Decode("====", &out));
+    CHECK_FALSE(Base64Decode("QQ===", &out));
+    CHECK_FALSE(Base64Decode("===", &out));
+
+    REQUIRE(Base64Decode("QQ==", &out));
+    CHECK(out == "A");
+    REQUIRE(Base64Decode("QUI=", &out));
+    CHECK(out == "AB");
+    REQUIRE(Base64Decode("QUJD", &out));
+    CHECK(out == "ABC");
   }
 
   // --- ParseGrpcStatus --------------------------------------------------------

@@ -52,6 +52,7 @@ class TimerHeap {
 
   size_t size() const { return callbacks_.size(); }
   bool empty() const { return callbacks_.empty(); }
+  size_t heap_size_for_test() const { return heap_.size(); }
 
  private:
   struct Entry {
@@ -67,6 +68,9 @@ class TimerHeap {
 
   // Pops heap entries whose timers were cancelled until the top is live.
   void PruneCancelledTop();
+  // Rebuilds the heap without cancelled tombstones once dead entries dominate,
+  // bounding memory even when an early live timer pins tombstones beneath it.
+  void CompactIfNeeded();
 
   std::vector<Entry> heap_;  // min-heap via std::push_heap/pop_heap with EntryLater
   std::unordered_map<TimerId, Callback> callbacks_;

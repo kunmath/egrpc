@@ -1,21 +1,22 @@
 // egrpc — channel: owns the EventThread and the transport (design §4.4).
 //
-// M3 scope: connect-on-first-call and a blocking unary entry point — the
-// "temporary internal API" of design §8/M3, which M4's grpcpp shim and M6's
-// full connectivity FSM (reconnect, backoff, wait-for-ready) build on. In
-// M3 a transport failure is terminal for the channel: in-flight and
-// subsequent calls fail with kUnavailable and no reconnect is attempted.
+// M5 scope: unary and server-streaming calls, Read-driven HTTP/2 stream flow
+// control (§5.4), per-call local deadline timers covering both queued and
+// active calls (§5.6), thread-safe TryCancel via sticky token + RST_STREAM
+// (§5.7), and immediate reset on framing violations. Reconnect/backoff lands
+// in M6; until then transport failure is terminal for the channel.
 //
 // Threading (design §3): the EventThread exclusively owns the TlsSocket,
-// the Http2Session, all timers, and every CallState transition. Caller
-// threads enter only via EventThread::Post + CallState::Wait; Shutdown
-// additionally joins the loop.
+// the Http2Session, all timers, and every CallState object (unique_ptr).
+// Caller threads interact only via EventThread::Post and CallCompletion
+// (shared_ptr with zero transport references); Shutdown joins the loop.
 #pragma once
 
 #include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <limits>
 #include <map>
 #include <memory>
@@ -40,6 +41,19 @@ struct ChannelOptions {
   // Default unlimited, matching upstream; GRPC_ARG_MAX_SEND_MESSAGE_LENGTH
   // maps here (§4.5).
   size_t max_send_message_size = std::numeric_limits<size_t>::max();
+  // Slack above max_receive_message_size + 5 B frame prefix used to derive
+  // HTTP/2 SETTINGS_INITIAL_WINDOW_SIZE (§5.4; window is derived, never
+  // independently smaller than max_receive_message_size + 5).
+  size_t stream_window_slack = 64 * 1024;
+  // Streaming delivery-queue bounds (§5.4). Whichever trips stops decoding
+  // from the scanner and withholds stream WINDOW_UPDATE credit. An empty
+  // queue always admits at least one legal message so Read() can make
+  // progress even when max_queued_bytes < max_receive_message_size; the
+  // effective byte ceiling is therefore max(max_queued_bytes,
+  // max_receive_message_size + 5).
+  size_t max_queued_messages = 16;
+  // 0 defaults to the derived stream window (§5.4).
+  size_t max_queued_bytes = 0;
   std::chrono::milliseconds connect_timeout{20000};
   // Prepended to the built-in user-agent (§5.1); upstream's
   // GRPC_ARG_PRIMARY_USER_AGENT maps here.
@@ -48,6 +62,11 @@ struct ChannelOptions {
 
 class ChannelImpl {
  public:
+  struct CallHandle {
+    uint64_t call_id = 0;
+    std::shared_ptr<CallCompletion> completion;
+  };
+
   // Does not connect; the transport comes up on the first call (design
   // §4.4: IDLE until a call needs the connection).
   ChannelImpl(std::string host, uint16_t port, TlsConfig tls, ChannelOptions options);
@@ -56,65 +75,119 @@ class ChannelImpl {
   ChannelImpl(const ChannelImpl&) = delete;
   ChannelImpl& operator=(const ChannelImpl&) = delete;
 
-  // Blocking unary call, safe from any thread. `request` is the serialized
-  // request message (protobuf-lite bytes; framing is added here). `metadata`
-  // is the caller's initial metadata, raw: keys are lowercased and `-bin`
-  // values base64-encoded on the way to the wire (§5.1). `deadline` is
-  // absolute (steady clock): the grpc-timeout header is computed from it
-  // when the HEADERS are actually built on the EventThread, so time spent
-  // queued (e.g. during connect) is not re-promised to the server; a call
-  // whose deadline has passed by then fails with kDeadlineExceeded without
-  // being submitted (local deadline timers land in M5). Returns the full
-  // result: status, response bytes, metadata.
-  CallState::Result UnaryCall(
+  // Allocates a unique call id ahead of StartCall so callers (e.g.
+  // ClientContext::TryCancel binding) can wire cancellation before the op is
+  // posted. Safe from any thread.
+  uint64_t AllocateCallId() { return next_call_id_.fetch_add(1, std::memory_order_relaxed); }
+
+  // Starts a unary or server-streaming call and returns its CallHandle without
+  // blocking. If `preallocated_id` is non-zero it is used as the call id; if
+  // `prebound_completion` is non-null it is used as the CallCompletion block.
+  // Safe from any thread.
+  CallHandle StartCall(CallMode mode, const std::string& method_path, std::string request,
+                       Http2Session::HeaderList metadata = {},
+                       std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt,
+                       uint64_t preallocated_id = 0,
+                       std::shared_ptr<CallCompletion> prebound_completion = nullptr);
+
+  // Blocking unary call, safe from any thread. Convenience wrapper over
+  // StartCall(CallMode::kUnary, ...) + Wait().
+  CallCompletion::Result UnaryCall(
       const std::string& method_path, std::string request, Http2Session::HeaderList metadata = {},
       std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt);
 
-  // Diagnostics/tests: high-water mark of concurrently active calls.
-  // Readable from any thread (atomic; written on the EventThread).
-  size_t max_active_calls() const { return max_active_calls_.load(std::memory_order_relaxed); }
+  // Requests cancellation of `call_id` (pending, active, or draining). Safe
+  // from any thread; idempotent. Callers should also set the sticky cancel
+  // token on CallCompletion before calling this so pre-admission races settle
+  // deterministically (§5.7).
+  void CancelCall(uint64_t call_id);
+  // Allocation-free, noexcept cancellation path used by ClientContext::TryCancel()
+  // and ~ClientStreamRawImpl(): sets the sticky token, links `completion` onto
+  // an intrusive queue, and rings the eventfd without allocating.
+  void CancelCall(const std::shared_ptr<CallCompletion>& completion) noexcept;
 
-  // Design §5.7 (M3 subset): refuse new calls with kUnavailable, fail
-  // in-flight calls, terminate the HTTP/2 session gracefully with a
-  // best-effort flush, close the socket, join the EventThread. Idempotent;
-  // called by the destructor. TODO(M6): the §5.7 bounded-time guarantee
-  // (default 5 s) needs the loop-death handling in EventThread — until then
-  // Shutdown assumes a live loop (all M3 paths keep it alive).
+  // Notifies the EventThread that a streaming Read() popped a message of
+  // `wire_bytes` (5 + payload.size()), allowing the scanner to drain further
+  // messages and returning stream-level HTTP/2 flow-control credit (§5.4).
+  // Safe from any thread.
+  void NotifyReadConsumed(uint64_t call_id, size_t wire_bytes);
+
+  // Derived HTTP/2 stream window (effective_max_receive_message_size + 5 + slack).
+  uint32_t stream_window_size() const { return stream_window_; }
+  // Effective receive message cap (clamped so stream_window_ >= cap + 5).
+  size_t max_receive_message_size() const { return effective_max_receive_message_size_; }
+
+  // Diagnostics/tests (§8/M5): internal high-water counters, readable from
+  // any thread (atomics written on the EventThread).
+  size_t max_active_calls() const { return max_active_calls_.load(std::memory_order_relaxed); }
+  size_t max_reassembly_bytes() const {
+    return max_reassembly_bytes_.load(std::memory_order_relaxed);
+  }
+  size_t max_queued_messages() const {
+    return max_queued_messages_.load(std::memory_order_relaxed);
+  }
+  size_t max_queued_bytes() const { return max_queued_bytes_.load(std::memory_order_relaxed); }
+
+  // Design §5.7: refuse new calls with kUnavailable, fail in-flight calls,
+  // terminate the HTTP/2 session gracefully with a best-effort flush, close
+  // the socket, join the EventThread. Idempotent; called by the destructor.
   void Shutdown();
 
  private:
   enum class State { kIdle, kConnecting, kReady, kFailed, kShutdown };
 
   struct PendingCall {
-    std::shared_ptr<CallState> call;
+    uint64_t call_id = 0;
+    CallMode mode = CallMode::kUnary;
+    std::shared_ptr<CallCompletion> completion;
     std::string method_path;
     std::string framed_body;
     Http2Session::HeaderList metadata;
     std::optional<std::chrono::steady_clock::time_point> deadline;
+    TimerId deadline_timer = 0;
   };
 
   // --- Event-thread only ----------------------------------------------------
+  void DrainCancelQueue();
+  void ClearCancelQueue();
   void HandleNewCall(PendingCall pc);
+  void HandleCancelCall(uint64_t call_id);
+  void HandleReadConsumed(uint64_t call_id, size_t wire_bytes);
+  void OnCallDeadline(uint64_t call_id);
+  void TerminateCallById(uint64_t call_id, StatusCode code, const char* message,
+                         bool timer_already_fired);
   void StartConnecting();
   void OnConnectProgress();
   void StartSession();
   void OnSocketReady(short revents);
+  void ProcessPendingIgnoredConsumes();
+  void ProcessPendingProtocolResets();
+  void ProcessPendingStreamResets();
+  void FailPendingCalls(StatusCode code, const std::string& message);
   void SubmitCall(PendingCall pc);
   // Concurrent-stream admission cap: min(local max_concurrent_streams,
   // server's advertised SETTINGS value). Calls beyond it wait in
   // pending_calls_.
   size_t MaxConcurrentCalls() const;
   // Submits queued calls while below the cap. Called wherever a slot may
-  // have freed (stream close) or the cap may have grown (server SETTINGS)
-  // — both only surface from the receive path, and never from inside an
-  // Http2Session callback (the session must not be re-entered, §4.2).
+  // have freed (stream close, deadline/cancel/protocol-error reset) or the
+  // cap may have grown (server SETTINGS) — never from inside an Http2Session
+  // callback (the session must not be re-entered, §4.2).
   void PumpPendingCalls();
+  // Schedules a deferred PumpPendingCalls() + FlushOutput() on the next loop
+  // turn (safe to call from inside nghttp2 callbacks such as on_close).
+  void SchedulePumpPendingCalls();
   void FlushOutput();
   void DrainSocket();
   void RearmKeepalive();
-  // Terminal transport failure: fails every pending and in-flight call with
-  // kUnavailable(detail), closes the transport, state → kFailed.
-  void TearDown(const std::string& detail);
+  // Terminal transport failure: fails every pending and active call with
+  // kUnavailable(detail) (honoring preemptive cancel/deadline first), closes
+  // the transport, state → kFailed. Already wire-complete draining_calls_
+  // keep draining locally unless finalize_draining is true (fatal event-loop
+  // exit, which fails them with kUnavailable so streams are never silently
+  // truncated with OK). Taken by value so callers may pass h2_->error() /
+  // sock_.error() safely before TearDown() destroys h2_ or closes sock_.
+  void TearDown(std::string detail, bool finalize_draining = false);
   void CancelTimersAndUnwatch();
   void DoShutdown();
 
@@ -123,15 +196,28 @@ class ChannelImpl {
   const std::string authority_;  // host:port (§5.1)
   const TlsConfig tls_;
   const ChannelOptions options_;
+  const size_t effective_max_receive_message_size_;
+  const uint32_t stream_window_;
+  const size_t effective_max_queued_bytes_;
 
   EventThread loop_;
   // Set once in the constructor. When false the loop never runs, so nothing
   // may be Post()ed — queued ops would strand their waiters forever.
   bool loop_ok_ = false;
 
+  std::atomic<uint64_t> next_call_id_{1};
+
   // Serializes Shutdown() callers (they must not race the Stop/join).
   std::mutex shutdown_mu_;
   bool shutdown_done_ = false;
+  // Intrusive no-alloc cancellation queue drained on EventThread wakeups.
+  std::mutex cancel_mu_;
+  bool cancel_closed_ = false;
+  std::shared_ptr<CallCompletion> cancel_head_;
+  // Snapshot of terminal transport/loop failure readable from caller threads
+  // if loop_.Post() returns false after a fatal poll() exit.
+  mutable std::mutex terminal_error_mu_;
+  std::string terminal_error_;
 
   // --- Event-thread owned (design §3; never touched by callers) -------------
   State state_ = State::kIdle;
@@ -139,14 +225,37 @@ class ChannelImpl {
   std::unique_ptr<Http2Session> h2_;
   TimerId connect_timer_ = 0;
   TimerId keepalive_timer_ = 0;
-  // Queued while kConnecting, and while at the concurrent-stream cap.
-  std::vector<PendingCall> pending_calls_;
-  std::map<CallState*, std::shared_ptr<CallState>> active_calls_;
+  bool read_yield_pending_ = false;
+  bool pump_scheduled_ = false;
+  bool tls_read_wants_write_ = false;
+  bool tls_write_pending_ = false;
+  bool tls_write_wants_read_ = false;
+  // Queued while kConnecting, awaiting initial server SETTINGS, or at the
+  // concurrent-stream cap.
+  std::deque<PendingCall> pending_calls_;
+  // Streams currently open on the wire (mapped by call_id).
+  std::map<uint64_t, std::unique_ptr<CallState>> active_calls_;
+  // Server-streaming calls whose wire stream closed cleanly while complete
+  // messages remained in scanner_ behind a full delivery queue.
+  std::map<uint64_t, std::unique_ptr<CallState>> draining_calls_;
+  // Ignored non-200/non-gRPC DATA chunks (stream_id, bytes) recorded inside
+  // nghttp2 callbacks; returned via h2_->ConsumeStream once ReceiveBytes exits.
+  std::vector<std::pair<int32_t, size_t>> pending_ignored_consumes_;
+  // Active call_ids that hit a framing violation inside nghttp2 callbacks;
+  // reset via h2_->ResetStream once DrainSocket() unwinds.
+  std::vector<uint64_t> pending_protocol_resets_;
+  // Stream IDs whose server side already sent END_STREAM while our upload
+  // side remained open (e.g. zero request-body window + trailers-only error);
+  // reset via h2_->ResetStream once ReceiveBytes() unwinds.
+  std::vector<int32_t> pending_stream_resets_;
   std::string failure_detail_;  // why state_ == kFailed
 
-  // High-water mark of active_calls_.size(); written on the EventThread,
+  // Internal buffer/concurrency high-water marks; written on the EventThread,
   // read from test/diagnostic threads.
   std::atomic<size_t> max_active_calls_{0};
+  std::atomic<size_t> max_reassembly_bytes_{0};
+  std::atomic<size_t> max_queued_messages_{0};
+  std::atomic<size_t> max_queued_bytes_{0};
 };
 
 }  // namespace internal

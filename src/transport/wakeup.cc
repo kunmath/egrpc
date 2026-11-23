@@ -16,7 +16,7 @@ Wakeup::~Wakeup() {
   if (fd_ >= 0) close(fd_);
 }
 
-void Wakeup::Notify() {
+void Wakeup::Notify() noexcept {
   if (fd_ < 0) return;
   const uint64_t one = 1;
   ssize_t rc;

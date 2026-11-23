@@ -47,9 +47,10 @@ struct Http2SessionOptions {
   // handful of unary calls.
   uint32_t max_concurrent_streams = 8;
 
-  // SETTINGS_INITIAL_WINDOW_SIZE for streams, and the target connection
-  // window (§5.4). M5 ties stream WINDOW_UPDATE to Read() consumption; until
-  // then nghttp2's automatic window management is used.
+  // SETTINGS_INITIAL_WINDOW_SIZE for streams, and the minimum target
+  // connection window (§5.4). Unary streams return credit immediately on DATA
+  // receipt; server-streaming streams tie stream WINDOW_UPDATE to Read()
+  // consumption via ConsumeStream().
   uint32_t initial_window_size = 4 * 1024 * 1024;
 
   // Keepalive (§5.2). keepalive_time: send PING after this long with no
@@ -98,6 +99,11 @@ class Http2Session {
     // One DATA chunk (may be any slice of a gRPC message; the CallState
     // scanner reassembles).
     std::function<void(const uint8_t* data, size_t len)> on_data;
+    // Server sent END_STREAM on HEADERS or DATA (half-closed remote). Fires at
+    // most once, right after on_response_headers / on_trailers / on_data for
+    // that frame — lets the owner finalize the RPC immediately even if the
+    // request upload side has not finished sending END_STREAM yet.
+    std::function<void()> on_response_end_stream;
     // Stream fully closed. error_code is the HTTP/2 error code
     // (0 = NO_ERROR); fires exactly once, after which no other hook runs.
     // Streams still open when the session is torn down do NOT get on_close —
@@ -140,19 +146,51 @@ class Http2Session {
   void ConsumeOutput(size_t n);
   // True if the session has (or may generate) output — poll for POLLOUT.
   bool WantWrite();
+  // True if nghttp2 still expects to read frames. When both WantRead() and
+  // WantWrite() are false, nghttp2 has terminated the session (e.g. after
+  // sending GOAWAY on a connection error) and the owner must tear down.
+  bool WantRead() const;
+  // True if the client (upload) side of stream_id has not yet sent END_STREAM.
+  bool IsStreamLocalOpen(int32_t stream_id) const;
 
-  // --- Streams (§4.3 send path) --------------------------------------------
+  // HTTP/2 RST_STREAM error codes used by higher layers (RFC 7540 §7).
+  static constexpr uint32_t kHttp2NoError = 0x0;
+  static constexpr uint32_t kHttp2Cancel = 0x8;
+
+  // --- Streams (§4.3 send path, §5.4 flow control) --------------------------
   // Submits a unary request: HEADERS (from `headers`, in order, pseudo-
   // headers first) followed by `body` — the already-framed gRPC message —
   // sent via a data provider with END_STREAM at the end (unary half-closes
   // immediately). An empty body still half-closes with an empty DATA/EOF.
+  // Unary stream credit is returned immediately on DATA receipt.
   // Returns the stream id (> 0), or -1 on failure (error() has detail; the
   // draining() case fails here too — no new streams after GOAWAY).
   // The frames land in the output buffer on the next PendingOutput() pass.
   int32_t SubmitUnaryRequest(const HeaderList& headers, std::string body, StreamHooks hooks);
 
+  // Submits a server-streaming request (single framed request message +
+  // END_STREAM, multiple response messages). Stream-level flow-control credit
+  // is withheld until the owner calls ConsumeStream() as Read() pops decoded
+  // messages (§5.4); connection-level credit is still returned immediately so
+  // one stalled stream cannot starve sibling calls.
+  int32_t SubmitServerStreamRequest(const HeaderList& headers, std::string body, StreamHooks hooks);
+
+  // Returns `bytes` of stream-level flow-control credit for a manual-flow
+  // (server-streaming) stream. No-op if the stream is already closed or uses
+  // immediate credit. May queue a stream WINDOW_UPDATE into PendingOutput().
+  void ConsumeStream(int32_t stream_id, size_t bytes);
+
+  // Queues RST_STREAM(error_code) for `stream_id` (e.g., kHttp2Cancel on
+  // TryCancel, deadline expiry, early Finish, or framing error). Safe no-op
+  // if the session is uninitialized or the stream is already closed.
+  // Per-call failures record detail in call_error(), never fatal error().
+  bool ResetStream(int32_t stream_id, uint32_t error_code = kHttp2Cancel);
+
   // Streams with hooks still registered (submitted, not yet closed).
   int active_streams() const { return active_streams_; }
+
+  // True once the server's initial SETTINGS frame has been received.
+  bool remote_settings_received() const { return remote_settings_received_; }
 
   // The server's advertised SETTINGS_MAX_CONCURRENT_STREAMS. Before its
   // first SETTINGS arrives this is nghttp2's RFC-default "unlimited"
@@ -187,8 +225,11 @@ class Http2Session {
   bool draining() const;
   bool goaway_too_many_pings() const;
   // Human-readable fatal-error detail (valid once ReceiveBytes/PendingOutput
-  // reported failure or ok() is false).
+  // reported failure or ok() is false). Non-fatal per-call errors (such as
+  // submit refused after GOAWAY) are reported via call_error() instead so
+  // healthy in-flight streams are never torn down.
   const std::string& error() const;
+  const std::string& call_error() const { return call_error_; }
 
   // Diagnostics/tests: outstanding keepalive ping, acked ping count.
   bool ping_outstanding() const;
@@ -207,12 +248,23 @@ class Http2Session {
     std::string body;
     size_t body_offset = 0;
     HeaderList pending_headers;  // filled by on_header, drained on frame end
+    bool manual_flow_control = false;
+    bool final_response_headers_seen = false;
+    // Exact count of received DATA payload bytes not yet released via
+    // ConsumeStream(). Subtracted from nghttp2's effective recv_data_length to
+    // compute exact returnable credit (popped payload + unacked padding).
+    size_t unconsumed_payload_bytes = 0;
   };
+
+  int32_t SubmitRequest(const HeaderList& headers, std::string body, StreamHooks hooks,
+                        bool manual_flow_control);
+  void FlushManualStreamCredit(Stream* stream, int32_t stream_id);
 
   Http2SessionOptions options_;
   Hooks hooks_;
   nghttp2_session* session_ = nullptr;
-  std::string error_;
+  std::string error_;       // fatal session errors only
+  std::string call_error_;  // non-fatal per-call errors (submit/reset)
 
   // Outbound accumulation buffer (design §4.2: send via memory buffers
   // flushed to TlsSocket): [out_consumed_, out_.size()) is unsent.
@@ -230,6 +282,7 @@ class Http2Session {
 
   bool draining_ = false;
   bool too_many_pings_ = false;
+  bool remote_settings_received_ = false;
 };
 
 }  // namespace internal

@@ -1,18 +1,22 @@
-// egrpc grpcpp shim — synchronous streaming surface (design §4.5).
+// egrpc grpcpp shim — synchronous streaming surface (design §4.5, §5.8).
 //
-// ClientReader<R> is the v0.1 server-streaming API; until M5 lands the real
-// entry point, its factory hands back a stub whose Read() returns false and
-// Finish() returns UNIMPLEMENTED. Client-streaming and bidi types
+// ClientReader<R> is the v0.1 server-streaming API, backed by an opaque
+// byte-level ClientStreamRaw (implemented in src/api/channel.cc) so this
+// public header never leaks core types. Client-streaming and bidi types
 // (ClientWriter, ClientReaderWriter) are permanently compile-present-only,
 // as are the server-side types — egrpc has no server (design §2).
 #pragma once
 
 #include <grpcpp/client_context.h>
 #include <grpcpp/impl/channel_interface.h>
+#include <grpcpp/impl/proto_utils.h>
 #include <grpcpp/impl/rpc_method.h>
 #include <grpcpp/support/status.h>
 
 #include <cstdint>
+#include <memory>
+#include <string>
+#include <utility>
 
 namespace grpc {
 
@@ -61,6 +65,22 @@ class WriterInterface {
   bool Write(const W& msg) { return Write(msg, WriteOptions()); }
 };
 
+// Opaque byte-level server-streaming driver (implemented in src/api/channel.cc).
+class ClientStreamRaw {
+ public:
+  virtual ~ClientStreamRaw() = default;
+  virtual void WaitForInitialMetadata() = 0;
+  virtual bool ReadRaw(std::string* response_bytes) = 0;
+  virtual bool NextMessageSize(uint32_t* sz) = 0;
+  virtual void CancelWithError(Status status) = 0;
+  virtual Status Finish() = 0;
+};
+
+std::unique_ptr<ClientStreamRaw> StartServerStreamRaw(ChannelInterface* channel,
+                                                      const RpcMethod& method,
+                                                      ClientContext* context,
+                                                      const std::string& request);
+
 }  // namespace internal
 
 template <class R>
@@ -75,28 +95,54 @@ template <class R>
 class ClientReaderFactory;
 }  // namespace internal
 
-// TODO(M5): the real server-streaming reader over CallState per-Read
-// delivery. This stub only satisfies the generated code's contract shape.
+// Server-streaming reader implementing the §5.8 lifecycle contract:
+//   - WaitForInitialMetadata(): legal before the first Read(); idempotent.
+//   - Read(): single-reader (asserted out-of-line in debug); after the first
+//     false every subsequent Read() returns false immediately.
+//   - Finish(): at most once (asserted out-of-line in debug). Calling Finish()
+//     without draining cancels-and-discards so flow control cannot deadlock.
+//   - ~ClientReader(): if Finish() was not called, performs non-blocking
+//     cancel-and-discard.
+// All debug assertions live out-of-line in ClientStreamRawImpl so inline
+// methods here remain ODR-identical across Debug and Release TUs.
 template <class R>
 class ClientReader final : public ClientReaderInterface<R> {
  public:
-  void WaitForInitialMetadata() override {}
+  void WaitForInitialMetadata() override {
+    if (raw_) raw_->WaitForInitialMetadata();
+  }
+
   bool Read(R* msg) override {
-    (void)msg;
-    return false;
+    if (!raw_) return false;
+    std::string bytes;
+    if (!raw_->ReadRaw(&bytes)) return false;
+    Status parse = SerializationTraits<R>::Deserialize(bytes, msg);
+    if (!parse.ok()) {
+      raw_->CancelWithError(std::move(parse));
+      return false;
+    }
+    return true;
   }
+
   bool NextMessageSize(uint32_t* sz) override {
-    (void)sz;
-    return false;
+    if (!raw_) return false;
+    return raw_->NextMessageSize(sz);
   }
+
   Status Finish() override {
-    return Status(StatusCode::UNIMPLEMENTED, "server streaming not implemented yet (egrpc M5)");
+    if (!raw_) return lame_status_;
+    return raw_->Finish();
   }
 
  private:
   template <class>
   friend class internal::ClientReaderFactory;
-  ClientReader() = default;
+
+  explicit ClientReader(std::unique_ptr<internal::ClientStreamRaw> raw) : raw_(std::move(raw)) {}
+  explicit ClientReader(Status lame_status) : lame_status_(std::move(lame_status)) {}
+
+  std::unique_ptr<internal::ClientStreamRaw> raw_;
+  Status lame_status_;
 };
 
 template <class W>
@@ -186,11 +232,10 @@ class ClientReaderFactory {
   template <class W>
   static ClientReader<R>* Create(ChannelInterface* channel, const RpcMethod& method,
                                  grpc::ClientContext* context, const W& request) {
-    (void)channel;
-    (void)method;
-    (void)context;
-    (void)request;
-    return new ClientReader<R>();
+    std::string request_bytes;
+    Status s = SerializationTraits<W>::Serialize(request, &request_bytes);
+    if (!s.ok()) return new ClientReader<R>(std::move(s));
+    return new ClientReader<R>(StartServerStreamRaw(channel, method, context, request_bytes));
   }
 };
 

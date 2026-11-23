@@ -16,6 +16,7 @@ import importlib
 import os
 import sys
 import tempfile
+import threading
 import time
 from concurrent import futures
 
@@ -65,17 +66,40 @@ class RouteGuideTestServer:
         keyfile: path to the server private key (PEM).
     """
 
-    def __init__(self, certfile, keyfile):
+    def __init__(self, certfile, keyfile, max_concurrent_streams=None):
         self._certfile = certfile
         self._keyfile = keyfile
+        self._max_concurrent_streams = max_concurrent_streams
         self._server = None
         self.port = None
         self._pb2 = None
         self._pb2_grpc = None
+        self._cancel_lock = threading.Lock()
+        self._cancelled_calls = 0
+        self._cancel_event = threading.Event()
+
+    @property
+    def cancelled_calls(self):
+        with self._cancel_lock:
+            return self._cancelled_calls
+
+    def reset_cancellations(self):
+        with self._cancel_lock:
+            self._cancelled_calls = 0
+            self._cancel_event.clear()
+
+    def wait_for_cancellation(self, timeout=5.0):
+        return self._cancel_event.wait(timeout=timeout)
+
+    def _record_cancellation(self):
+        with self._cancel_lock:
+            self._cancelled_calls += 1
+            self._cancel_event.set()
 
     def _make_servicer(self):
         pb2 = self._pb2
         pb2_grpc = self._pb2_grpc
+        server_obj = self
 
         class _RouteGuideServicer(pb2_grpc.RouteGuideServicer):
             def GetFeature(self, request, context):
@@ -122,6 +146,27 @@ class RouteGuideTestServer:
                     time.sleep(0.5)
                     return pb2.Feature(name="slow", location=request)
 
+                # Cancellable slow unary: sleeps up to lon ms (default 5000ms),
+                # recording server-side cancellation if the client cancels or
+                # times out.
+                if lat == -6:
+                    cancelled = threading.Event()
+
+                    def _on_done():
+                        if not context.is_active():
+                            cancelled.set()
+                            server_obj._record_cancellation()
+
+                    context.add_callback(_on_done)
+                    wait_s = (lon / 1000.0) if lon > 0 else 5.0
+                    deadline = time.monotonic() + wait_s
+                    while time.monotonic() < deadline and context.is_active():
+                        if cancelled.wait(0.02):
+                            break
+                    if not context.is_active():
+                        return pb2.Feature()
+                    return pb2.Feature(name="slow-unary-done", location=request)
+
                 # Known point: send initial metadata first, then the feature.
                 if lat == 1000 and lon == 2000:
                     context.send_initial_metadata((("egrpc-initial", "iv1"),))
@@ -130,12 +175,144 @@ class RouteGuideTestServer:
                 # Unknown point (route_guide semantics: empty name).
                 return pb2.Feature(name="", location=request)
 
+            def ListFeatures(self, request, context):
+                mode = request.lo.latitude
+
+                # Mode 0: normal multi-feature stream with initial & trailing
+                # metadata (including -bin keys).
+                if mode == 0:
+                    context.send_initial_metadata(
+                        (
+                            ("egrpc-stream-init", "siv1"),
+                            ("egrpc-stream-init-bin", b"\xde\xad"),
+                        )
+                    )
+                    for i in range(5):
+                        yield pb2.Feature(
+                            name="feat-{}".format(i),
+                            location=pb2.Point(latitude=100 + i, longitude=200 + i),
+                        )
+                    context.set_trailing_metadata(
+                        (
+                            ("egrpc-stream-trail", "stv1"),
+                            ("egrpc-stream-trail-bin", b"\xbe\xef"),
+                        )
+                    )
+                    return
+
+                # Mode 1: empty stream (0 messages, OK).
+                if mode == 1:
+                    context.send_initial_metadata((("egrpc-stream-init", "empty"),))
+                    context.set_trailing_metadata((("egrpc-stream-trail", "empty-ok"),))
+                    return
+
+                # Mode 2: error mid-stream after 3 messages.
+                if mode == 2:
+                    context.send_initial_metadata((("egrpc-stream-init", "mid-err"),))
+                    for i in range(3):
+                        yield pb2.Feature(
+                            name="ok-{}".format(i),
+                            location=pb2.Point(latitude=i, longitude=i),
+                        )
+                    context.set_trailing_metadata((("egrpc-err-trail", "et1"),))
+                    context.abort(
+                        grpc.StatusCode.RESOURCE_EXHAUSTED, "mid-stream boom"
+                    )
+                    return
+
+                # Mode 3: trailers-only error (no initial metadata, no DATA).
+                if mode == 3:
+                    context.set_trailing_metadata((("egrpc-to-trail", "to1"),))
+                    context.abort(
+                        grpc.StatusCode.PERMISSION_DENIED, "stream denied"
+                    )
+                    return
+
+                # Mode 4: burst of N small messages (default 40) to exercise
+                # client-side kDraining when > max_queued_messages arrive
+                # before the caller reads them all.
+                if mode == 4:
+                    count = request.hi.latitude if request.hi.latitude > 0 else 40
+                    for i in range(count):
+                        yield pb2.Feature(
+                            name="drain-{}".format(i),
+                            location=pb2.Point(latitude=i, longitude=0),
+                        )
+                    return
+
+                # Mode 5: fast producer emitting count x payload_bytes messages
+                # for Read-driven HTTP/2 flow-control backpressure tests.
+                if mode == 5:
+                    cancelled = threading.Event()
+
+                    def _on_done():
+                        if not context.is_active():
+                            cancelled.set()
+                            server_obj._record_cancellation()
+
+                    context.add_callback(_on_done)
+                    count = request.hi.latitude if request.hi.latitude > 0 else 60
+                    size = request.hi.longitude if request.hi.longitude > 0 else 4096
+                    payload = "p" * size
+                    for i in range(count):
+                        if not context.is_active():
+                            return
+                        yield pb2.Feature(
+                            name=payload,
+                            location=pb2.Point(latitude=i, longitude=size),
+                        )
+                    return
+
+                # Mode 6: slow/blocking stream for TryCancel and deadline tests.
+                # Emits lo.longitude initial messages, then holds the stream
+                # open up to hi.latitude ms (default 10000ms) watching for cancel.
+                if mode == 6:
+                    cancelled = threading.Event()
+
+                    def _on_done():
+                        if not context.is_active():
+                            cancelled.set()
+                            server_obj._record_cancellation()
+
+                    context.add_callback(_on_done)
+                    context.send_initial_metadata((("egrpc-stream-init", "slow"),))
+                    initial = max(0, request.lo.longitude)
+                    for i in range(initial):
+                        if not context.is_active():
+                            return
+                        yield pb2.Feature(
+                            name="pre-{}".format(i),
+                            location=pb2.Point(latitude=i, longitude=0),
+                        )
+                    wait_s = (
+                        (request.hi.latitude / 1000.0)
+                        if request.hi.latitude > 0
+                        else 10.0
+                    )
+                    deadline = time.monotonic() + wait_s
+                    while time.monotonic() < deadline and context.is_active():
+                        if cancelled.wait(0.02):
+                            break
+                    return
+
+                context.abort(
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    "unknown ListFeatures mode {}".format(mode),
+                )
+
         return _RouteGuideServicer()
 
     def start(self):
         self._pb2, self._pb2_grpc = _generate_stubs()
 
-        self._server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
+        options = []
+        if self._max_concurrent_streams is not None:
+            options.append(
+                ("grpc.max_concurrent_streams", int(self._max_concurrent_streams))
+            )
+        self._server = grpc.server(
+            futures.ThreadPoolExecutor(max_workers=16), options=options
+        )
         self._pb2_grpc.add_RouteGuideServicer_to_server(
             self._make_servicer(), self._server
         )

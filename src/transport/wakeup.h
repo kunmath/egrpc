@@ -25,7 +25,7 @@ class Wakeup {
 
   // Any thread. Wakes a poller blocked on fd(). Coalesces with pending
   // notifications; ignores EAGAIN (a wakeup is already pending).
-  void Notify();
+  void Notify() noexcept;
 
   // Event thread only. Clears the pending notification count so poll() does
   // not spin.

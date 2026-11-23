@@ -210,3 +210,27 @@ TEST_CASE("TimerHeap: size/empty track Add, Cancel, RunDue") {
   CHECK(heap.empty());
   CHECK(heap.size() == 0);
 }
+
+TEST_CASE("TimerHeap: Tombstone compaction bounds heap size when an early timer stays live") {
+  TimerHeap heap;
+  const auto base = Base();
+  int early_fired = 0;
+  int cancelled_fired = 0;
+
+  heap.Add(base + std::chrono::seconds(10), [&] { ++early_fired; });
+
+  for (int i = 0; i < 500; ++i) {
+    const auto deadline = base + std::chrono::seconds(20) + std::chrono::milliseconds(i);
+    const TimerId id = heap.Add(deadline, [&] { ++cancelled_fired; });
+    REQUIRE(heap.Cancel(id));
+    CHECK(heap.heap_size_for_test() <= 64u);
+  }
+
+  CHECK(heap.size() == 1u);
+  CHECK(heap.heap_size_for_test() <= 64u);
+
+  CHECK(heap.RunDue(base + std::chrono::seconds(10)) == 1u);
+  CHECK(early_fired == 1);
+  CHECK(cancelled_fired == 0);
+  CHECK(heap.empty());
+}

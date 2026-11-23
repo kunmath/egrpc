@@ -17,7 +17,21 @@ TimerId TimerHeap::Add(Clock::time_point deadline, Callback cb) {
   return id;
 }
 
-bool TimerHeap::Cancel(TimerId id) { return callbacks_.erase(id) != 0; }
+bool TimerHeap::Cancel(TimerId id) {
+  if (callbacks_.erase(id) == 0) return false;
+  CompactIfNeeded();
+  return true;
+}
+
+void TimerHeap::CompactIfNeeded() {
+  constexpr size_t kMinCompactThreshold = 64;
+  if (heap_.size() <= kMinCompactThreshold || heap_.size() <= callbacks_.size() * 2) return;
+  auto new_end = std::remove_if(heap_.begin(), heap_.end(), [this](const Entry& e) {
+    return callbacks_.find(e.id) == callbacks_.end();
+  });
+  heap_.erase(new_end, heap_.end());
+  std::make_heap(heap_.begin(), heap_.end(), EntryLater{});
+}
 
 void TimerHeap::PruneCancelledTop() {
   while (!heap_.empty() && callbacks_.find(heap_.front().id) == callbacks_.end()) {
