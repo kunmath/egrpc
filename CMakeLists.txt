@@ -120,6 +120,7 @@ option(EGRPC_BUILD_EXAMPLES "Build examples (M4 shim acceptance)" ${_egrpc_is_to
 
 if(EGRPC_BUILD_EXAMPLES)
   add_subdirectory(examples/route_guide)
+  add_subdirectory(examples/resilient_subscribe)
 endif()
 
 # ---------------------------------------------------------------------------
