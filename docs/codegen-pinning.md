@@ -64,19 +64,47 @@ by a pre-25.0 protoc fails with `#error`. Concretely:
 | Consuming build | protobuf-lite runtime | protoc for `.pb.h/.cc` |
 |---|---|---|
 | CI / Ubuntu images (checked-in gencode, e.g. `examples/route_guide/gen/`) | 3.21.12 | **protoc 21.12** (official prebuilt, `protoc-21.12-linux-x86_64.zip`, SHA-256 `3a4c1e5f2516c639d3079b1586e703fc7bcfa2136d58bda24d1d54f949c315e8`) |
-| Yocto **scarthgap** (the supported LTS, design §8) | 4.25.3 (meta-oe `protobuf_4.25.3.bb`; stable-branch point updates stay on 4.25.x) | **protoc 25.x matching the recipe** — in-recipe regeneration via `protobuf-native`, the standard Yocto pattern; the checked-in 21.12 gencode is desktop/CI-only and **must not** ship to target |
+| Yocto **scarthgap** (the supported LTS, design §8) | 4.25.x — **4.25.8** resolved in the 2026-11-24 spike (scarthgap 5.0.21; stable-branch point updates stay on 4.25.x) | **protoc 25.x matching the recipe** — in-recipe regeneration via `protobuf-native`, the standard Yocto pattern; the checked-in 21.12 gencode is desktop/CI-only and **must not** ship to target |
 
 The M8 `meta-egrpc` recipe therefore regenerates all message gencode from the
 `.proto` files at build time with `protobuf-native` (which bitbake keeps in
 lockstep with the target runtime); only stub gencode (`.grpc.pb.*`) uses the
-pinned plugin. This was validated analytically against scarthgap's recipe and
-protobuf's version guards (2026-07); the pre-M5 bitbake spike (design §8a)
-confirms it empirically.
+pinned plugin. This was first validated analytically (2026-07) and then
+**confirmed empirically by the pre-M5 bitbake spike** (design §8a,
+docs/yocto-spike.md), executed 2026-11-24:
+
+- Yocto scarthgap, `DISTRO_VERSION` 5.0.21; poky
+  `86a777b24f93803dcac8950c03c55da602186af8`, meta-openembedded
+  `96c2c78e13ff1b954715ff3c6d26bddd50a02509`; `MACHINE` `qemuarm64`,
+  `TARGET_SYS` `aarch64-poky-linux`; egrpc at
+  `9320f06b181e6aa14066a0f5f2f8ede8fd5e60cd`.
+- Resolved recipes: protobuf / protobuf-native **4.25.8** (`protoc --version`
+  → `libprotoc 25.8`), nghttp2 1.61.0, openssl 3.5.9, gcc-cross-aarch64 13.5.0.
+- Outcome: `bitbake egrpc-spike` succeeded end-to-end; `libegrpc.so`,
+  `libegrpc.a`, and `egrpc_route_guide_client` compiled and linked as
+  aarch64 ELF. In-recipe 25.8 message gencode compiled against
+  protobuf-lite 4.25.8, and the checked-in v1.82.0 `.grpc.pb.*` (byte-identical
+  to the repo) compiled against 4.25.8 headers via `include/grpcpp/`. The 2
+  generated TUs build with `-w` (per `examples/route_guide/CMakeLists.txt`), so
+  that proves compilation, not warning-cleanliness; the 13 handwritten TUs
+  (12 `src/**` + `client_main.cc`) built warning-free under GCC 13.5.0 with
+  `-std=c++17 -Wall -Wextra -Werror`.
+- Recipe deviation from the draft: `EXTRA_OECMAKE =
+  "-DEGRPC_BUILD_TESTS=OFF -DEGRPC_BUILD_EXAMPLES=ON"` replaces
+  `-DBUILD_TESTING=OFF` (egrpc's CMake options are `EGRPC_BUILD_TESTS` /
+  `EGRPC_BUILD_EXAMPLES`). No egrpc code or CMake changes were required.
+- Runtime note for M8: egrpc and `libegrpc.so` have no Abseil dependency, but
+  scarthgap's protobuf 4.25.8 depends on abseil-cpp 20240116 (`.so.2401.0.0`):
+  `libprotobuf-lite.so.25.8.0` NEEDs 10 `libabsl_*` libraries, and
+  `egrpc_route_guide_client` links 2 directly via protobuf gencode/headers.
+  Target images that use generated stubs must ship abseil-cpp.
 
 Open item (M4 CI wiring, extended to M8): the pinned `grpc_cpp_plugin`
 (built on protobuf 35.0) must accept the CodeGeneratorRequest produced by
 whichever protoc drives it — 21.12 on CI, 25.x inside the Yocto recipe.
-Verify per driver; if a driver's request is rejected, drive the plugin from
+Verify per driver (still untested for 25.x: `tools/bin/grpc_cpp_plugin` was
+not built during the 2026-11-24 spike, which used the checked-in v1.82.0 stub
+copies; deferred to M8); if a driver's request is rejected, drive the plugin from
 the pinned protoc 35.0 instead (the plugin emits no message code, so the
 runtime match constraint does not apply to its output — only the `.pb.*`
 generation must use the runtime-matched protoc).

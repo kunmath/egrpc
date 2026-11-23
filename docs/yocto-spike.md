@@ -1,11 +1,12 @@
 # Pre-M5 Yocto feasibility spike (design §8a)
 
-**Status: procedure ready, not yet executed — needs a Yocto build host**
-(~80 GB disk, ~1–3 h first build). The analytic half of the gate is done:
-scarthgap ships protobuf 4.25.3 (meta-oe), whose C++ runtime hard-rejects
-pre-25.0 gencode (`PROTOBUF_MIN_PROTOC_VERSION 4025000`), which drove the
-per-runtime message-codegen matrix in docs/codegen-pinning.md. This spike
-confirms the matrix empirically. It is throwaway — the polished layer is M8.
+**Status: PASSED (executed 2026-11-24 on Yocto scarthgap 5.0.21).**
+`bitbake egrpc-spike` built libegrpc (shared + static) and the route_guide
+unary client for `qemuarm64` (aarch64) against scarthgap's protobuf-lite
+4.25.8, nghttp2 1.61.0 and OpenSSL 3.5.9 with GCC 13.5.0. All four
+known-unknowns are settled (see Empirical results). No egrpc code or CMake
+changes were required; the only recipe fix was the CMake option names. The
+spike was throwaway — the polished layer is M8.
 
 ## What green means
 
@@ -47,7 +48,10 @@ LAYERSERIES_COMPAT_egrpc-spike = "scarthgap"
 ```
 
 `recipes-spike/egrpc/egrpc-spike_0.1.bb` (adjust `SRC_URI`/`SRCREV` to the
-commit under test; `file://` + `externalsrc` is fine for a local tree):
+commit under test; `file://` + `externalsrc` is fine for a local tree — the
+executed spike used a local bare mirror,
+`SRC_URI = "git:///work/egrpc-mirror.git;protocol=file;branch=yocto-scarthgap-spike"`,
+with `SRCREV = "9320f06b181e6aa14066a0f5f2f8ede8fd5e60cd"`):
 
 ```
 SUMMARY = "egrpc pre-M5 feasibility spike (design §8a) — throwaway"
@@ -71,7 +75,7 @@ do_configure:prepend() {
            ${S}/examples/route_guide/route_guide.proto
 }
 
-EXTRA_OECMAKE = "-DBUILD_TESTING=OFF"
+EXTRA_OECMAKE = "-DEGRPC_BUILD_TESTS=OFF -DEGRPC_BUILD_EXAMPLES=ON"
 ```
 
 ## What to record on completion
@@ -95,3 +99,74 @@ before M5, while the codegen policy is still cheap to change.
    kind of thing analysis misses.
 4. C++17 + `-Wall -Wextra -Werror` under scarthgap's default GCC 13
    cross-toolchain.
+
+## Empirical results (2026-11-24)
+
+### Build environment
+
+- Yocto scarthgap, `DISTRO_VERSION` 5.0.21
+- poky `86a777b24f93803dcac8950c03c55da602186af8`
+- meta-openembedded `96c2c78e13ff1b954715ff3c6d26bddd50a02509`
+- `MACHINE` `qemuarm64` (tune cortexa57), `TARGET_SYS` `aarch64-poky-linux`
+- egrpc `9320f06b181e6aa14066a0f5f2f8ede8fd5e60cd`
+- Build container: `numaview-yocto:scarthgap` (Docker, run as the normal
+  user). Successful attempt: 1004 tasks, all succeeded, ~18 min. Two earlier
+  attempts failed in `do_fetch` only, due to network errors (fixed by
+  pre-seeding bare git mirrors) — an environment issue, not an egrpc one.
+
+### Resolved component versions
+
+| Component | Version |
+|---|---|
+| protobuf | 4.25.8 |
+| protobuf-native (`protoc`) | 4.25.8 (`libprotoc 25.8`) |
+| nghttp2 | 1.61.0 |
+| openssl | 3.5.9 |
+| gcc-cross-aarch64 | 13.5.0 |
+| cmake-native / ninja | 3.28.3 / 1.11.1 |
+
+### Known-unknown outcomes
+
+1. **protobuf-lite 4.25.x + in-recipe gencode: yes.** The regenerated
+   `route_guide.pb.h` carries 25.8 version guards (`PROTOBUF_VERSION < 4025000`,
+   `4025008 < PROTOBUF_MIN_PROTOC_VERSION`) for the `LITE_RUNTIME` proto;
+   `route_guide.pb.cc` compiled with `-std=c++17` and the client links
+   `libprotobuf-lite.so.25.8.0`.
+2. **CMake cross-discovery: yes.** `do_configure` found OpenSSL 3.5.9,
+   Nghttp2 1.61.0 and protobuf-lite 25.8.0 all inside `recipe-sysroot`; every
+   `OPENSSL_*`, `Nghttp2_*`, `ProtobufLite_*` include/library variable points
+   there, and no compile/link command in `do_compile` has `-I/usr/include` or
+   `-L/usr/lib`.
+3. **Unmodified v1.82.0 stubs vs 4.25.x headers: compiles.** The
+   `route_guide.grpc.pb.{cc,h}` in `${S}` are SHA-256-identical to the repo
+   copies and `route_guide.grpc.pb.cc` compiled against protobuf 4.25.8 headers
+   and `include/grpcpp/`. Like the other generated TU it is built with `-w`
+   (`examples/route_guide/CMakeLists.txt`), so this shows it compiles, not that
+   it is warning-clean.
+4. **C++17 + `-Wall -Wextra -Werror` under GCC 13: yes.** With
+   `aarch64-poky-linux-g++ (GCC) 13.5.0`, the 13 handwritten TUs (12 `src/**`
+   + `examples/route_guide/client_main.cc`) built with the full flag set and
+   no `-w`: 0 warnings, 0 errors. The 2 generated TUs (`route_guide.pb.cc`,
+   `route_guide.grpc.pb.cc`) built with `-w`, as intended.
+
+### ELF linkage
+
+| Artifact | Type | NEEDED | Size unstripped → stripped |
+|---|---|---|---|
+| `libegrpc.so.0.1.0` | ELF64 shared object, aarch64, SONAME `libegrpc.so.0` | libssl.so.3, libcrypto.so.3, libnghttp2.so.14, libstdc++, libm, libgcc_s, libc | 5,970,968 → 329,784 |
+| `libegrpc.a` | ar archive, 12 ELF64 REL AArch64 members | n/a | 14,235,386 |
+| `egrpc_route_guide_client` | ELF64 PIE, aarch64 | libssl.so.3, libcrypto.so.3, libnghttp2.so.14, libprotobuf-lite.so.25.8.0, libabsl_log_internal_check_op.so.2401.0.0, libabsl_log_internal_message.so.2401.0.0, libstdc++, libm, libgcc_s, libc | 8,294,304 → 396,408 |
+
+**Abseil (M8 runtime finding):** egrpc's source and `libegrpc.so` have zero
+Abseil dependency, but scarthgap's protobuf 4.25.8 depends on abseil-cpp
+20240116 (`.so.2401.0.0`): `libprotobuf-lite.so.25.8.0` NEEDs 10 `libabsl_*`
+libraries, and the client links 2 directly via protobuf gencode/headers. Any
+image using generated stubs must ship abseil-cpp as a protobuf runtime dep.
+
+### egrpc fixes required
+
+None. The only change was the recipe's `EXTRA_OECMAKE` option names
+(`-DEGRPC_BUILD_TESTS=OFF -DEGRPC_BUILD_EXAMPLES=ON` instead of the draft's
+`-DBUILD_TESTING=OFF`). Not tested: driving the pinned `grpc_cpp_plugin`
+from 25.x `protoc` (`tools/bin/grpc_cpp_plugin` was not built; the spike
+used checked-in stubs) — deferred to M8.
