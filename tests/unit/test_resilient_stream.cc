@@ -110,7 +110,9 @@ struct Harness {
           int i = calls++;
           {
             std::lock_guard<std::mutex> lock(mu);
-            wait_for_ready_seen.push_back(ctx.wait_for_ready());
+            wait_for_ready_seen.push_back(ctx.wait_for_ready() &&
+                                          !ctx.egrpc_initial_metadata_received() &&
+                                          !ctx.egrpc_status_is_local());
           }
           Script s;
           if (static_cast<size_t>(i) < scripts.size()) {
@@ -530,5 +532,147 @@ TEST_SUITE("resilient_stream") {
     o.retry_reset_threshold = std::chrono::milliseconds(-1);
     egrpc::resilient_stream<std::string> rs(o, h.factory());
     CHECK(Drain(rs) == std::vector<std::string>{"a"});
+  }
+
+  TEST_CASE("stop with buffered messages on open reader") {
+    Harness h;
+    h.scripts = {Msgs({"a", "b", "c"})};
+    egrpc::resilient_stream<std::string> rs(FastOpts(), h.factory());
+    std::string m;
+    REQUIRE(rs.Read(&m));
+    rs.stop();
+    CHECK_FALSE(rs.Read(&m));
+    CHECK(m == "a");
+    CHECK(rs.status().error_code() == StatusCode::CANCELLED);
+  }
+
+  TEST_CASE("stop concurrent with throwing on_reconnected") {
+    Harness h;
+    h.scripts = {Msgs({"a"}), Msgs({"b", "c"})};
+    auto o = FastOpts();
+    std::promise<void> entered;
+    std::atomic<bool> stop_called{false};
+    o.on_reconnected = [&] {
+      entered.set_value();
+      // Give stop() time to block on the in-flight callback.
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      throw std::runtime_error("boom");
+    };
+    egrpc::resilient_stream<std::string> rs(o, h.factory());
+    std::string m;
+    REQUIRE(rs.Read(&m));
+    std::thread stopper([&] {
+      entered.get_future().wait();
+      rs.stop();
+      stop_called = true;
+    });
+    CHECK_THROWS_AS(rs.Read(&m), std::runtime_error);
+    stopper.join();
+    CHECK_FALSE(rs.Read(&m));
+    CHECK(m == "a");
+    CHECK(rs.status().error_code() == StatusCode::CANCELLED);
+  }
+
+  TEST_CASE("stop waits for blocking should_retry; CANCELLED wins") {
+    Harness h;
+    h.scripts = {Msgs({"a"}, Status(StatusCode::NOT_FOUND, "nf"))};
+    auto o = FastOpts();
+    std::promise<void> entered;
+    std::promise<void> release;
+    auto release_f = release.get_future().share();
+    std::atomic<bool> finished{false};
+    o.should_retry = [&](const Status&, bool) {
+      entered.set_value();
+      release_f.wait();
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      finished = true;
+      return false;
+    };
+    egrpc::resilient_stream<std::string> rs(o, h.factory());
+    std::string m;
+    REQUIRE(rs.Read(&m));
+    bool second = true;
+    std::thread reader([&] { second = rs.Read(&m); });
+    entered.get_future().wait();
+    std::atomic<bool> stop_returned{false};
+    std::thread stopper([&] {
+      rs.stop();
+      stop_returned = true;
+      CHECK(finished.load());
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK_FALSE(stop_returned.load());
+    release.set_value();
+    stopper.join();
+    reader.join();
+    CHECK_FALSE(second);
+    CHECK(rs.status().error_code() == StatusCode::CANCELLED);
+  }
+
+  TEST_CASE("RetryBackoff slow multiplier reaches max beyond 64 retries; reset") {
+    egrpc::detail::RetryBackoff b;
+    b.Configure(std::chrono::milliseconds(100), 1.01, std::chrono::milliseconds(30000), 0.0);
+    CHECK(b.Next() == std::chrono::milliseconds(100));
+    std::chrono::milliseconds at64{0};
+    std::chrono::milliseconds last{0};
+    for (int i = 1; i < 1000; ++i) {
+      last = b.Next();
+      if (i == 64) at64 = last;
+    }
+    CHECK(at64 < std::chrono::milliseconds(200));
+    CHECK(last == std::chrono::milliseconds(30000));
+    b.Reset();
+    CHECK(b.Next() == std::chrono::milliseconds(100));
+    CHECK(b.Next() == std::chrono::milliseconds(101));
+  }
+
+  TEST_CASE("RetryBackoff extreme durations clamp safely") {
+    for (double jitter : {0.0, 0.2}) {
+      CAPTURE(jitter);
+      egrpc::detail::RetryBackoff b;
+      b.Configure(std::chrono::milliseconds::max(), 1.6, std::chrono::milliseconds::max(), jitter);
+      for (int i = 0; i < 5; ++i) {
+        const auto d = b.Next();
+        CHECK(d.count() > 0);
+        CHECK(d.count() <= 9000000000000000000LL);
+      }
+    }
+  }
+
+  TEST_CASE("stop wakes a max-duration backoff") {
+    for (double jitter : {0.0, 0.2}) {
+      CAPTURE(jitter);
+      Harness h;
+      h.scripts = {NoMeta(Status(StatusCode::UNAVAILABLE, "x"))};
+      egrpc::ResilientStreamOptions o;
+      o.initial_retry_delay = std::chrono::milliseconds::max();
+      o.max_retry_delay = std::chrono::milliseconds::max();
+      o.retry_backoff_jitter = jitter;
+      egrpc::resilient_stream<std::string> rs(o, h.factory());
+      std::thread t([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        rs.stop();
+      });
+      std::string m;
+      CHECK_FALSE(rs.Read(&m));
+      t.join();
+      CHECK(rs.status().error_code() == StatusCode::CANCELLED);
+    }
+  }
+
+  TEST_CASE("stable stream resets backoff") {
+    Harness h;
+    h.scripts = {NoMeta(Status(StatusCode::UNAVAILABLE, "x")), Msgs({"a"}), Msgs({"b"}, kTerminal)};
+    egrpc::ResilientStreamOptions o;
+    o.initial_retry_delay = std::chrono::milliseconds(1);
+    o.retry_backoff_multiplier = 10000.0;
+    o.max_retry_delay = std::chrono::milliseconds(10000);
+    o.retry_backoff_jitter = 0.0;
+    o.retry_reset_threshold = std::chrono::milliseconds(0);
+    egrpc::resilient_stream<std::string> rs(o, h.factory());
+    const auto start = Clock::now();
+    // Without reset the second retry would wait 10 s.
+    CHECK(Drain(rs) == std::vector<std::string>{"a", "b"});
+    CHECK(Clock::now() - start < std::chrono::milliseconds(2000));
   }
 }

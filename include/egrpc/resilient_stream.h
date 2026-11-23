@@ -59,6 +59,62 @@ struct ResilientStreamOptions {
   std::chrono::milliseconds retry_reset_threshold{60000};
 };
 
+namespace detail {
+
+// Exponential retry backoff with jitter for resilient_stream (mirrors
+// src/core/backoff.cc). Inputs must already be sanitized.
+class RetryBackoff {
+ public:
+  void Configure(std::chrono::milliseconds initial, double multiplier,
+                 std::chrono::milliseconds max, double jitter) {
+    initial_ms_ = static_cast<double>(initial.count());
+    max_ms_ = static_cast<double>(max.count());
+    multiplier_ = multiplier;
+    jitter_ = jitter;
+    Reset();
+  }
+
+  void Reset() {
+    current_base_ms_ = initial_ms_;
+    first_ = true;
+  }
+
+  // Unjittered base of the most recent Next().
+  std::chrono::milliseconds last_base() const { return ToMs(current_base_ms_); }
+
+  std::chrono::milliseconds Next() {
+    if (first_) {
+      first_ = false;
+    } else {
+      current_base_ms_ = std::min(max_ms_, current_base_ms_ * multiplier_);
+    }
+    double delay = current_base_ms_;
+    if (jitter_ > 0.0 && delay > 0.0) {
+      std::uniform_real_distribution<double> dist(-jitter_, jitter_);
+      delay *= 1.0 + dist(rng_);
+    }
+    return ToMs(std::min(max_ms_, delay));
+  }
+
+ private:
+  static std::chrono::milliseconds ToMs(double ms) {
+    constexpr double kMaxMs = 9.0e18;
+    if (!(ms > 0.0)) return std::chrono::milliseconds(0);
+    if (ms > kMaxMs) ms = kMaxMs;
+    return std::chrono::milliseconds(std::llround(ms));
+  }
+
+  double initial_ms_ = 0.0;
+  double max_ms_ = 0.0;
+  double multiplier_ = 1.0;
+  double jitter_ = 0.0;
+  double current_base_ms_ = 0.0;
+  bool first_ = true;
+  std::minstd_rand rng_{std::random_device{}()};
+};
+
+}  // namespace detail
+
 template <class R>
 class resilient_stream {
  public:
@@ -68,6 +124,8 @@ class resilient_stream {
   resilient_stream(ResilientStreamOptions options, Factory factory)
       : options_(std::move(options)), factory_(std::move(factory)) {
     Sanitize();
+    backoff_.Configure(options_.initial_retry_delay, options_.retry_backoff_multiplier,
+                       options_.max_retry_delay, options_.retry_backoff_jitter);
   }
   explicit resilient_stream(Factory factory)
       : resilient_stream(ResilientStreamOptions(), std::move(factory)) {}
@@ -88,6 +146,8 @@ class resilient_stream {
   }
 
   // Single-reader. Returns false once the stream terminated; see status().
+  // Calling Read() or stop() from inside on_reconnected or should_retry is
+  // undefined behavior (asserted in debug builds).
   bool Read(R* msg) {
     assert(!IsCallbackThread() && "resilient_stream::Read() called from on_reconnected");
     const bool was_in_read = in_read_.exchange(true);
@@ -133,19 +193,7 @@ class resilient_stream {
           const bool is_reconnect = has_connected_once_;
           has_connected_once_ = true;
           if (options_.on_reconnected && (is_reconnect || options_.fire_on_first_connect)) {
-            bool fire = false;
-            {
-              std::lock_guard<std::mutex> lock(mu_);
-              if (!stopped_) {
-                in_callback_ = true;
-                callback_thread_id_ = std::this_thread::get_id();
-                fire = true;
-              }
-            }
-            if (fire) {
-              CallbackGuard cb_guard{this};
-              options_.on_reconnected();
-            }
+            RunCallback([this] { options_.on_reconnected(); });
             if (IsStopped()) {
               AbandonActive();
               return FinishWith(Cancelled());
@@ -154,6 +202,10 @@ class resilient_stream {
         }
       }
 
+      if (IsStopped()) {
+        AbandonActive();
+        return FinishWith(Cancelled());
+      }
       if (reader_ctx_->egrpc_initial_metadata_received() && active_reader_->Read(msg)) {
         return true;
       }
@@ -166,17 +218,39 @@ class resilient_stream {
       if (IsStopped()) {
         return FinishWith(s.error_code() == grpc::StatusCode::CANCELLED ? s : Cancelled());
       }
-      const bool retry = options_.should_retry ? options_.should_retry(s, is_local)
-                                               : DefaultShouldRetry(s, is_local);
+      bool retry = false;
+      if (options_.should_retry) {
+        RunCallback([&] { retry = options_.should_retry(s, is_local); });
+        if (IsStopped()) return FinishWith(Cancelled());
+      } else {
+        retry = DefaultShouldRetry(s, is_local);
+      }
       if (!retry) return FinishWith(s);
 
-      const std::chrono::milliseconds delay = NextDelay();
+      if (has_established_at_) {
+        if (std::chrono::steady_clock::now() - attempt_established_at_ >=
+            options_.retry_reset_threshold) {
+          backoff_.Reset();
+        }
+        has_established_at_ = false;
+      }
+      const std::chrono::milliseconds delay = backoff_.Next();
       Log(LogLevel::kInfo, "resilient_stream",
           "stream ended (code " + std::to_string(static_cast<int>(s.error_code())) + ": " +
               s.error_message() + "); retrying in " + std::to_string(delay.count()) + " ms");
       if (delay.count() > 0) {
         std::unique_lock<std::mutex> lock(mu_);
-        if (cv_.wait_for(lock, delay, [this] { return stopped_; })) {
+        const auto now = std::chrono::steady_clock::now();
+        const auto headroom = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::time_point::max() - now);
+        bool woken_by_stop;
+        if (delay >= headroom) {
+          cv_.wait(lock, [this] { return stopped_; });
+          woken_by_stop = true;
+        } else {
+          woken_by_stop = cv_.wait_until(lock, now + delay, [this] { return stopped_; });
+        }
+        if (woken_by_stop) {
           terminal_status_ = Cancelled();
           finished_ = true;
           return false;
@@ -226,6 +300,20 @@ class resilient_stream {
       self->cv_.notify_all();
     }
   };
+
+  // Runs a user callback unless stopped, registering it so stop() blocks
+  // until it returns (even if it throws).
+  template <class F>
+  void RunCallback(F&& f) {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      if (stopped_) return;
+      in_callback_ = true;
+      callback_thread_id_ = std::this_thread::get_id();
+    }
+    CallbackGuard cb_guard{this};
+    f();
+  }
 
   static grpc::Status Cancelled() {
     return grpc::Status(grpc::StatusCode::CANCELLED, "resilient_stream stopped");
@@ -278,29 +366,6 @@ class resilient_stream {
     if (options_.retry_reset_threshold < ms(0)) options_.retry_reset_threshold = ms(0);
   }
 
-  std::chrono::milliseconds NextDelay() {
-    if (has_established_at_) {
-      if (std::chrono::steady_clock::now() - attempt_established_at_ >=
-          options_.retry_reset_threshold) {
-        retry_attempt_ = 0;
-      }
-      has_established_at_ = false;
-    }
-    const double initial = static_cast<double>(options_.initial_retry_delay.count());
-    const double max = static_cast<double>(options_.max_retry_delay.count());
-    double base = initial * std::pow(options_.retry_backoff_multiplier, retry_attempt_);
-    if (!std::isfinite(base) || base > max) base = max;
-    if (retry_attempt_ < 64) ++retry_attempt_;
-    double delay = base;
-    if (options_.retry_backoff_jitter > 0.0 && base > 0.0) {
-      std::uniform_real_distribution<double> dist(-options_.retry_backoff_jitter,
-                                                  options_.retry_backoff_jitter);
-      delay = base * (1.0 + dist(rng_));
-    }
-    delay = std::min(max, std::max(0.0, delay));
-    return std::chrono::milliseconds(static_cast<long long>(delay));
-  }
-
   ResilientStreamOptions options_;
   Factory factory_;
 
@@ -311,8 +376,7 @@ class resilient_stream {
   bool has_connected_once_ = false;
   bool has_established_at_ = false;
   std::chrono::steady_clock::time_point attempt_established_at_{};
-  int retry_attempt_ = 0;
-  std::minstd_rand rng_{std::random_device{}()};
+  detail::RetryBackoff backoff_;
   std::atomic<bool> in_read_{false};
 
   // Shared state guarded by mu_.
