@@ -14,6 +14,8 @@
 #include <memory>
 #include <string>
 
+#include "api/client_stream_raw_internal.h"
+#include "core/call_state.h"
 #include "core/channel_impl.h"
 #include "doctest/doctest.h"
 #include "grpcpp/channel.h"
@@ -77,6 +79,23 @@ TEST_SUITE("shim_args") {
     CHECK_FALSE(ctx.egrpc_initial_metadata_received());
     grpc::internal::ClientContextAccess::MarkInitialMetadataReceived(nullptr);
     grpc::internal::ClientContextAccess::MarkInitialMetadataReceived(&ctx);
+    CHECK(ctx.egrpc_initial_metadata_received());
+  }
+
+  TEST_CASE("Finish() without WaitForInitialMetadata marks valid initial metadata arrival") {
+    auto completion = std::make_shared<egrpc::internal::CallCompletion>();
+    egrpc::internal::CallState call(4 * 1024 * 1024, egrpc::internal::CallMode::kServerStreaming,
+                                    completion, 16, 4 * 1024 * 1024);
+    call.OnResponseHeaders({{":status", "200"}, {"content-type", "application/grpc"}},
+                           /*end_stream=*/false);
+    call.OnTrailers({{"grpc-status", "0"}});
+    call.OnClose(0);
+
+    grpc::ClientContext ctx;
+    std::unique_ptr<grpc::internal::ClientStreamRaw> raw =
+        grpc::internal::MakeClientStreamRawForCompletion(&ctx, completion, 4 * 1024 * 1024);
+    const grpc::Status s = raw->Finish();
+    CHECK(s.ok());
     CHECK(ctx.egrpc_initial_metadata_received());
   }
 
