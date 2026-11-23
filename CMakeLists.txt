@@ -58,6 +58,7 @@ set(EGRPC_SOURCES
   src/api/channel.cc
   src/api/create_channel.cc
   src/api/log.cc
+  src/api/channel_config.cc
 )
 
 # ---------------------------------------------------------------------------

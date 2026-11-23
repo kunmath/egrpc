@@ -12,13 +12,14 @@
 #include <string>
 #include <utility>
 
+#include "api/target_parse.h"
 #include "core/channel_impl.h"
 
-namespace grpc {
-namespace {
+namespace egrpc {
+namespace internal {
 
 // "host:port", "host" (⇒ 443), optionally prefixed dns:///; bracketed IPv6.
-bool ParseTarget(const std::string& target, std::string* host, uint16_t* port) {
+bool ParseChannelTarget(const std::string& target, std::string* host, uint16_t* port) {
   std::string rest = target;
   constexpr char kDnsPrefix[] = "dns:///";
   if (rest.compare(0, sizeof(kDnsPrefix) - 1, kDnsPrefix) == 0) {
@@ -64,7 +65,10 @@ bool ParseTarget(const std::string& target, std::string* host, uint16_t* port) {
   return true;
 }
 
-}  // namespace
+}  // namespace internal
+}  // namespace egrpc
+
+namespace grpc {
 
 std::shared_ptr<Channel> CreateCustomChannel(const std::string& target,
                                              const std::shared_ptr<ChannelCredentials>& creds,
@@ -85,7 +89,7 @@ std::shared_ptr<Channel> CreateCustomChannel(const std::string& target,
 
   std::string host;
   uint16_t port = 0;
-  if (!ParseTarget(target, &host, &port)) {
+  if (!egrpc::internal::ParseChannelTarget(target, &host, &port)) {
     return Channel::Lame(
         Status(StatusCode::INVALID_ARGUMENT, "unsupported channel target: " + target));
   }

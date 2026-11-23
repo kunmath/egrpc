@@ -102,6 +102,7 @@ ChannelImpl::ChannelImpl(std::string host, uint16_t port, TlsConfig tls, Channel
           ComputeStreamWindow(effective_max_receive_message_size_, options_.stream_window_slack)),
       effective_max_queued_bytes_(options_.max_queued_bytes == 0 ? stream_window_
                                                                  : options_.max_queued_bytes),
+      loop_(EventThread::Options{options_.event_thread_stack_size}),
       backoff_(MakeBackoffOptions(options_)),
       resolver_(options_.resolve_fn),
       effective_keepalive_time_(options_.http2.keepalive_time) {
