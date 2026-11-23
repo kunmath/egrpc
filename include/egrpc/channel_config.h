@@ -17,6 +17,11 @@
 namespace egrpc {
 
 struct ChannelConfig {
+  // Upper bound (1 year) accepted by Validate() for every duration field.
+  // Keeps internal nanosecond/steady_clock arithmetic (jitter, doubling,
+  // now() + duration) far below int64_t overflow.
+  static constexpr std::chrono::milliseconds kMaxDuration{365LL * 24 * 60 * 60 * 1000};
+
   // --- TLS -----------------------------------------------------------------
   // Root CA bundle: file path, or inline PEM (wins when both are set). When
   // neither is set, the system default trust store is used.
@@ -59,7 +64,8 @@ struct ChannelConfig {
   // --- Thread & identity (§3, §5.1) ----------------------------------------
   // EventThread stack size; 0 = platform default.
   size_t event_thread_stack_size = 128 * 1024;
-  // Prepended to the built-in user-agent.
+  // Prepended to the built-in user-agent. Must not contain ASCII control
+  // characters (0x00-0x1f, 0x7f).
   std::string user_agent_prefix;
 
   // Named profile for cellular links (§5.2): keepalive_time = 60 s,
@@ -73,7 +79,8 @@ struct ChannelConfig {
   // after which egrpc doubles keepalive_time for subsequent connections.
   static ChannelConfig CellularProfile();
 
-  // Returns true when the configuration is usable. On failure, returns false
+  // Returns true when the configuration is usable. Every duration field must
+  // be <= kMaxDuration. On failure, returns false
   // and (if `error` is non-null) stores a human-readable reason.
   bool Validate(std::string* error = nullptr) const;
 };

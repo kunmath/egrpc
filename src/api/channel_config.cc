@@ -59,11 +59,32 @@ bool ChannelConfig::Validate(std::string* error) const {
     return Fail(error, "goaway_drain_timeout must be >= 0");
   }
   if (shutdown_timeout < milliseconds(0)) return Fail(error, "shutdown_timeout must be >= 0");
+  const struct {
+    milliseconds value;
+    const char* message;
+  } durations[] = {
+      {keepalive_time, "keepalive_time must be <= ChannelConfig::kMaxDuration"},
+      {keepalive_timeout, "keepalive_timeout must be <= ChannelConfig::kMaxDuration"},
+      {connect_timeout, "connect_timeout must be <= ChannelConfig::kMaxDuration"},
+      {initial_reconnect_backoff,
+       "initial_reconnect_backoff must be <= ChannelConfig::kMaxDuration"},
+      {max_reconnect_backoff, "max_reconnect_backoff must be <= ChannelConfig::kMaxDuration"},
+      {ready_stability_threshold,
+       "ready_stability_threshold must be <= ChannelConfig::kMaxDuration"},
+      {goaway_drain_timeout, "goaway_drain_timeout must be <= ChannelConfig::kMaxDuration"},
+      {shutdown_timeout, "shutdown_timeout must be <= ChannelConfig::kMaxDuration"},
+  };
+  for (const auto& d : durations) {
+    if (d.value > kMaxDuration) return Fail(error, d.message);
+  }
   if (max_receive_message_size == 0) return Fail(error, "max_receive_message_size must be > 0");
   if (max_send_message_size == 0) return Fail(error, "max_send_message_size must be > 0");
   if (max_queued_messages == 0) return Fail(error, "max_queued_messages must be > 0");
-  if (user_agent_prefix.find_first_of(std::string("\r\n\0", 3)) != std::string::npos) {
-    return Fail(error, "user_agent_prefix must not contain CR, LF, or NUL");
+  for (const char c : user_agent_prefix) {
+    const auto u = static_cast<unsigned char>(c);
+    if (u < 0x20 || u == 0x7f) {
+      return Fail(error, "user_agent_prefix must not contain ASCII control characters");
+    }
   }
   return true;
 }

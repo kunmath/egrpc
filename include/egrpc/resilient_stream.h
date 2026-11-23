@@ -110,11 +110,32 @@ class RetryBackoff {
   double jitter_ = 0.0;
   double current_base_ms_ = 0.0;
   bool first_ = true;
-  std::minstd_rand rng_{std::random_device{}()};
+  static std::minstd_rand::result_type MakeSeed() {
+    try {
+      std::random_device rd;
+      return rd();
+    } catch (...) {
+      // No working random_device (some embedded targets): fall back to time.
+      return static_cast<std::minstd_rand::result_type>(
+          std::chrono::steady_clock::now().time_since_epoch().count());
+    }
+  }
+
+  std::minstd_rand rng_{MakeSeed()};
 };
 
 }  // namespace detail
 
+// Re-establishes a server stream on retryable failures.
+//
+// The factory is called once per attempt with a FRESH ClientContext
+// (wait_for_ready set) and must start the RPC on it. A deadline set on that
+// ClientContext in the factory applies to THIS ATTEMPT ONLY, never as an
+// end-to-end deadline across retries. The factory must not call Read() or
+// stop() on the same resilient_stream.
+//
+// Destroying a resilient_stream concurrently with Read() is undefined; call
+// stop() and join the reader thread first.
 template <class R>
 class resilient_stream {
  public:
@@ -146,8 +167,8 @@ class resilient_stream {
   }
 
   // Single-reader. Returns false once the stream terminated; see status().
-  // Calling Read() or stop() from inside on_reconnected or should_retry is
-  // undefined behavior (asserted in debug builds).
+  // Calling Read() or stop() from inside the factory, on_reconnected or
+  // should_retry is undefined behavior (asserted in debug builds).
   bool Read(R* msg) {
     assert(!IsCallbackThread() && "resilient_stream::Read() called from on_reconnected");
     const bool was_in_read = in_read_.exchange(true);
@@ -172,18 +193,28 @@ class resilient_stream {
             finished_ = true;
             return false;
           }
+          // The factory is a registered callback: stop() waits for it.
           active_ctx_ = ctx;
+          in_callback_ = true;
+          callback_thread_id_ = std::this_thread::get_id();
         }
         reader_ctx_ = ctx;
         {
           FactoryGuard guard{this};
-          if (factory_) active_reader_ = factory_(*ctx);
+          {
+            CallbackGuard cb_guard{this};
+            if (factory_) active_reader_ = factory_(*ctx);
+          }
           guard.armed = false;
         }
         if (!active_reader_) {
           ClearContexts();
           return FinishWith(grpc::Status(grpc::StatusCode::INTERNAL,
                                          "resilient_stream factory returned null reader"));
+        }
+        if (IsStopped()) {
+          AbandonActive();
+          return FinishWith(Cancelled());
         }
 
         active_reader_->WaitForInitialMetadata();
@@ -261,8 +292,9 @@ class resilient_stream {
   }
 
   // Thread-safe, idempotent. Cancels the in-flight attempt, wakes any retry
-  // backoff, and blocks until an in-flight on_reconnected returns. Must not
-  // be called from inside on_reconnected.
+  // backoff, and blocks until an in-flight factory, on_reconnected or
+  // should_retry returns; none runs after stop() returns. Must not be called
+  // from inside those callbacks.
   void stop() {
     assert(!IsCallbackThread() && "resilient_stream::stop() called from on_reconnected");
     std::shared_ptr<grpc::ClientContext> ctx_to_cancel;

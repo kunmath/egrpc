@@ -63,6 +63,16 @@ milliseconds DoubleKeepaliveTime(milliseconds t) {
 }
 
 // Remaining whole milliseconds until `deadline` (0 if already passed).
+// now + d, saturating at time_point::max() instead of overflowing.
+steady_clock::time_point SaturatingDeadline(steady_clock::time_point now, milliseconds d) {
+  if (d <= milliseconds(0)) return now;
+  const auto headroom = steady_clock::time_point::max() - now;
+  if (std::chrono::duration_cast<milliseconds>(headroom) <= d) {
+    return steady_clock::time_point::max();
+  }
+  return now + d;
+}
+
 int RemainingMs(steady_clock::time_point deadline) {
   const auto now = steady_clock::now();
   if (deadline <= now) return 0;
@@ -256,7 +266,7 @@ void ChannelImpl::Shutdown() {
   shutdown_done_ = true;
 
   // The total budget starts now, not when DoShutdown() finally runs.
-  const auto deadline = steady_clock::now() + std::max(options_.shutdown_timeout, milliseconds(0));
+  const auto deadline = SaturatingDeadline(steady_clock::now(), options_.shutdown_timeout);
   shutdown_deadline_ns_.store(static_cast<int64_t>(deadline.time_since_epoch().count()),
                               std::memory_order_release);
 
@@ -1194,7 +1204,7 @@ void ChannelImpl::DoShutdown() {
   const int64_t deadline_ticks = shutdown_deadline_ns_.load(std::memory_order_acquire);
   const auto shutdown_deadline =
       deadline_ticks != 0 ? steady_clock::time_point(steady_clock::duration(deadline_ticks))
-                          : steady_clock::now() + budget;
+                          : SaturatingDeadline(steady_clock::now(), budget);
 
   // §5.7: unblock every waiter first, before any socket/DNS teardown.
   FailActiveCalls(kShutDownMessage);
@@ -1218,7 +1228,8 @@ void ChannelImpl::DoShutdown() {
   if (can_send_goaway) {
     // Graceful close: GOAWAY(NO_ERROR) + flush bounded by a short sub-budget
     // (best-effort; no waiting for the peer).
-    const auto close_deadline = std::min(shutdown_deadline, steady_clock::now() + sub_budget);
+    const auto close_deadline =
+        std::min(shutdown_deadline, SaturatingDeadline(steady_clock::now(), sub_budget));
     h2_->Terminate();
     for (;;) {
       // Checked every iteration (also after kOk writes) so a peer that keeps

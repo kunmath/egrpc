@@ -700,4 +700,94 @@ TEST_SUITE("resilient_stream") {
     CHECK(Drain(rs) == std::vector<std::string>{"a", "b"});
     CHECK(rs.status().error_code() == StatusCode::UNIMPLEMENTED);
   }
+
+  TEST_CASE("stop waits for a blocked factory and cancels its context") {
+    std::promise<void> entered;
+    std::promise<void> release;
+    std::shared_future<void> release_f = release.get_future().share();
+    std::atomic<int> calls{0};
+    std::atomic<bool> ctx_cancelled_on_return{false};
+    std::atomic<int> fired{0};
+    auto o = FastOpts();
+    o.fire_on_first_connect = true;
+    o.on_reconnected = [&] { ++fired; };
+    egrpc::resilient_stream<std::string> rs(
+        o,
+        [&](grpc::ClientContext& ctx) -> std::unique_ptr<grpc::ClientReaderInterface<std::string>> {
+          ++calls;
+          entered.set_value();
+          release_f.wait();
+          auto reader = std::make_unique<FakeClientReader>(&ctx, Msgs({"a"}));
+          std::string m;
+          // A context cancelled before the reader bound reports no data.
+          ctx_cancelled_on_return = !reader->Read(&m);
+          return reader;
+        });
+    std::thread reader([&] {
+      std::string m;
+      CHECK_FALSE(rs.Read(&m));
+    });
+    entered.get_future().wait();
+    std::atomic<bool> stop_returned{false};
+    std::thread stopper([&] {
+      rs.stop();
+      stop_returned = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK_FALSE(stop_returned.load());
+    release.set_value();
+    stopper.join();
+    reader.join();
+    CHECK(stop_returned.load());
+    CHECK(ctx_cancelled_on_return.load());
+    CHECK(calls == 1);
+    CHECK(fired == 0);
+    CHECK(rs.status().error_code() == StatusCode::CANCELLED);
+  }
+
+  TEST_CASE("throwing factory releases the stop barrier") {
+    egrpc::resilient_stream<std::string> rs(
+        FastOpts(),
+        [](grpc::ClientContext&) -> std::unique_ptr<grpc::ClientReaderInterface<std::string>> {
+          throw std::runtime_error("factory");
+        });
+    std::string m;
+    CHECK_THROWS_AS(rs.Read(&m), std::runtime_error);
+    auto done = std::async(std::launch::async, [&] { rs.stop(); });
+    CHECK(done.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    CHECK_FALSE(rs.Read(&m));
+    CHECK(rs.status().error_code() == StatusCode::CANCELLED);
+  }
+
+  TEST_CASE("local TryCancel on the attempt context terminates with CANCELLED") {
+    std::atomic<int> calls{0};
+    grpc::ClientContext* attempt = nullptr;
+    std::mutex amu;
+    std::promise<void> started;
+    Script s = Msgs({});
+    s.block_in_read = true;
+    egrpc::resilient_stream<std::string> rs(
+        FastOpts(),
+        [&](grpc::ClientContext& ctx) -> std::unique_ptr<grpc::ClientReaderInterface<std::string>> {
+          if (calls++ == 0) {
+            std::lock_guard<std::mutex> lock(amu);
+            attempt = &ctx;
+            auto r = std::make_unique<FakeClientReader>(&ctx, s);
+            started.set_value();
+            return r;
+          }
+          return std::make_unique<FakeClientReader>(&ctx, Msgs({"x"}));
+        });
+    std::thread canceller([&] {
+      started.get_future().wait();
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      std::lock_guard<std::mutex> lock(amu);
+      attempt->TryCancel();
+    });
+    std::string m;
+    CHECK_FALSE(rs.Read(&m));
+    canceller.join();
+    CHECK(calls == 1);
+    CHECK(rs.status().error_code() == StatusCode::CANCELLED);
+  }
 }

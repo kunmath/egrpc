@@ -169,6 +169,9 @@ TEST_SUITE("channel_config") {
     CheckInvalid([](auto& c) { c.max_send_message_size = 0; });
     CheckInvalid([](auto& c) { c.max_queued_messages = 0; });
     CheckInvalid([](auto& c) { c.user_agent_prefix = "bad\rua"; });
+    CheckInvalid([](auto& c) { c.user_agent_prefix = "bad\tua"; });
+    CheckInvalid([](auto& c) { c.user_agent_prefix = "bad\x01ua"; });
+    CheckInvalid([](auto& c) { c.user_agent_prefix = "bad\x7fua"; });
     CheckInvalid([](auto& c) { c.user_agent_prefix = "bad\nua"; });
     CheckInvalid([](auto& c) { c.user_agent_prefix = std::string("bad\0ua", 6); });
   }
@@ -219,5 +222,49 @@ TEST_SUITE("channel_config") {
     CheckLiveCancelled(egrpc::CreateChannel("127.0.0.1:1", platform));
     CheckLiveCancelled(egrpc::CreateChannel("dns:///127.0.0.1:1"));
     CheckLiveCancelled(egrpc::CreateChannel("[::1]:443"));
+  }
+
+  TEST_CASE("durations above kMaxDuration are rejected; kMaxDuration is accepted") {
+    using F = std::function<void(egrpc::ChannelConfig&, milliseconds)>;
+    const std::vector<F> setters = {
+        [](egrpc::ChannelConfig& c, milliseconds d) { c.keepalive_time = d; },
+        [](egrpc::ChannelConfig& c, milliseconds d) { c.keepalive_timeout = d; },
+        [](egrpc::ChannelConfig& c, milliseconds d) { c.connect_timeout = d; },
+        [](egrpc::ChannelConfig& c, milliseconds d) {
+          c.initial_reconnect_backoff = d;
+          c.max_reconnect_backoff = d;
+        },
+        [](egrpc::ChannelConfig& c, milliseconds d) { c.max_reconnect_backoff = d; },
+        [](egrpc::ChannelConfig& c, milliseconds d) { c.ready_stability_threshold = d; },
+        [](egrpc::ChannelConfig& c, milliseconds d) { c.goaway_drain_timeout = d; },
+        [](egrpc::ChannelConfig& c, milliseconds d) { c.shutdown_timeout = d; },
+    };
+    for (size_t i = 0; i < setters.size(); ++i) {
+      CAPTURE(i);
+      CheckInvalid([&](auto& c) { setters[i](c, milliseconds::max()); });
+      CheckInvalid(
+          [&](auto& c) { setters[i](c, egrpc::ChannelConfig::kMaxDuration + milliseconds(1)); });
+      CheckValid([&](auto& c) { setters[i](c, egrpc::ChannelConfig::kMaxDuration); });
+    }
+    egrpc::ChannelConfig bad;
+    bad.shutdown_timeout = milliseconds::max();
+    CheckLame(egrpc::CreateChannel("127.0.0.1:1", bad), grpc::StatusCode::INVALID_ARGUMENT);
+  }
+
+  TEST_CASE("CreateChannel with every duration at kMaxDuration shuts down cleanly") {
+    egrpc::ChannelConfig c;
+    const milliseconds m = egrpc::ChannelConfig::kMaxDuration;
+    c.keepalive_time = m;
+    c.keepalive_timeout = m;
+    c.connect_timeout = m;
+    c.initial_reconnect_backoff = m;
+    c.max_reconnect_backoff = m;
+    c.ready_stability_threshold = m;
+    c.goaway_drain_timeout = m;
+    c.shutdown_timeout = m;
+    REQUIRE(c.Validate());
+    auto channel = egrpc::CreateChannel("127.0.0.1:1", c);
+    REQUIRE(channel != nullptr);
+    channel.reset();
   }
 }

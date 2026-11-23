@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstring>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -144,5 +145,21 @@ TEST_SUITE("log") {
     }
     for (auto& th : threads) th.join();
     CHECK(delivered.load() == 4 * 500);
+  }
+
+  TEST_CASE("a throwing sink is suppressed and logging keeps working") {
+    LogStateGuard guard;
+    std::atomic<int> calls{0};
+    egrpc::SetLogSink([&](egrpc::LogLevel, const char*, const std::string&) {
+      ++calls;
+      throw std::runtime_error("sink");
+    });
+    CHECK_NOTHROW(egrpc::Log(egrpc::LogLevel::kError, "t", "one"));
+    CHECK_NOTHROW(egrpc::Log(egrpc::LogLevel::kError, "t", "two"));
+    CHECK(calls == 2);
+    std::atomic<int> ok{0};
+    egrpc::SetLogSink([&](egrpc::LogLevel, const char*, const std::string&) { ++ok; });
+    egrpc::Log(egrpc::LogLevel::kError, "t", "three");
+    CHECK(ok == 1);
   }
 }

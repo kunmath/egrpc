@@ -54,7 +54,12 @@ void Log(LogLevel level, const char* component, const std::string& message) {
     sink = s.sink;
   }
   if (sink) {
-    sink(level, comp, message);
+    try {
+      sink(level, comp, message);
+    } catch (...) {
+      // Never re-enter Log(): this may be running on an EventThread.
+      std::fprintf(stderr, "egrpc: ERROR: [log] custom LogSink threw an exception; suppressing\n");
+    }
   } else {
     std::fprintf(stderr, "egrpc: %s: [%s] %s\n", LogLevelName(level), comp, message.c_str());
   }
