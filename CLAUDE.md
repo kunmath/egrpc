@@ -46,9 +46,10 @@ return `UNIMPLEMENTED` at runtime.
 - Response: initial HEADERS `:status: 200` + `content-type: application/grpc*`,
   then DATA, then trailers with `grpc-status` (int) and optional `grpc-message`
   (percent-encoded UTF-8). **Trailers-only** responses (HEADERS with END_STREAM
-  carrying `grpc-status`, no DATA) are valid and must be handled. Missing
-  `grpc-status` at stream end → `INTERNAL`. When trailers carry `grpc-status` it
-  wins over HTTP-status mapping (table in design §5.5).
+  carrying `grpc-status`, no DATA) are valid and must be handled. Missing or
+  malformed `grpc-status` at a clean stream end → `UNKNOWN` (HTTP-status
+  fallback; 200 → UNKNOWN). When trailers carry `grpc-status` it wins over
+  HTTP-status mapping (table in design §5.5).
 
 ## Pinned codegen tools (design §4.5)
 
@@ -70,6 +71,8 @@ per egrpc release**, verified in CI by regenerating stubs and compiling.
 - **M2 — HTTP/2 session + keepalive plumbing: done**
 - **M3 — Hand-rolled unary call end-to-end: done**
 - **M4 — Shim: unary via unmodified generated stubs: done**
+- Pre-M5 gate (§8a): scarthgap bitbake spike validating the protobuf matrix —
+  scarthgap is the sole supported Yocto LTS for v0.1 (decided)
 - M5 — Server-streaming + deadlines + cancellation: not started
 - M6 — Resilience: reconnect, keepalive enforcement, shutdown: not started
 - M7 — resilient_stream + native config API: not started

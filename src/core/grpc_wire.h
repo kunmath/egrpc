@@ -46,8 +46,8 @@ StatusCode HttpStatusToGrpcCode(int http_status);
 // Parses a grpc-status trailer value: a base-10 non-negative integer with no
 // leading/trailing garbage. Values in [0, 16] map to their code; larger valid
 // integers map to kUnknown (matching upstream's unknown-code handling).
-// Returns false on a non-integer (the caller then treats the stream as
-// malformed → kInternal per §5.1).
+// Returns false on a non-integer (the caller then maps the call to kUnknown
+// per §5.5, upstream's malformed-grpc-status fallback).
 bool ParseGrpcStatus(const std::string& value, StatusCode* code);
 
 // --- Message framing (§5.1) -------------------------------------------------

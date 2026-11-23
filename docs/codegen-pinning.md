@@ -54,23 +54,32 @@ compiles against, and egrpc's runtime is the **system** protobuf-lite (design
 against the 3.21.x runtime that current Ubuntu/CI images ship, so using the
 pinned protoc for message codegen is impossible by construction.
 
-Policy for message codegen: checked-in `.pb.h/.cc` files (e.g.
-`examples/route_guide/gen/`) are generated with the **official prebuilt protoc
-matching the minimum supported system runtime** — for v0.1 that is
-**protoc 21.12** (== protobuf C++ 3.21.12,
-`protoc-21.12-linux-x86_64.zip`, SHA-256
-`3a4c1e5f2516c639d3079b1586e703fc7bcfa2136d58bda24d1d54f949c315e8`).
-Newer runtimes accept older gencode within protobuf's documented
-compatibility window, so these files also build on newer distros; targets
-whose runtime falls outside that window (e.g. a future Yocto LTS) regenerate
-from the `.proto` with their own matching protoc.
+Policy for message codegen: **message gencode is generated per consuming
+runtime, exact-minor matched.** There is no cross-version compatibility
+window to lean on: since the protobuf 4.x C++ line, the runtime hard-rejects
+older gencode at compile time via `PROTOBUF_MIN_PROTOC_VERSION` — e.g.
+protobuf 4.25.3 (`port_def.inc`) sets it to `4025000`, so anything generated
+by a pre-25.0 protoc fails with `#error`. Concretely:
 
-Open item for M4: the CI stub-diff will drive the pinned `grpc_cpp_plugin`
-from the host protoc; the plugin (built on protobuf 35.0) must accept the
-CodeGeneratorRequest a 21.12 protoc produces — verify this when wiring the
-M4 CI job, and if it does not hold, drive it from the pinned protoc 35.0
-instead (the plugin does not emit message code, so the runtime constraint
-does not apply to its output).
+| Consuming build | protobuf-lite runtime | protoc for `.pb.h/.cc` |
+|---|---|---|
+| CI / Ubuntu images (checked-in gencode, e.g. `examples/route_guide/gen/`) | 3.21.12 | **protoc 21.12** (official prebuilt, `protoc-21.12-linux-x86_64.zip`, SHA-256 `3a4c1e5f2516c639d3079b1586e703fc7bcfa2136d58bda24d1d54f949c315e8`) |
+| Yocto **scarthgap** (the supported LTS, design §8) | 4.25.3 (meta-oe `protobuf_4.25.3.bb`; stable-branch point updates stay on 4.25.x) | **protoc 25.x matching the recipe** — in-recipe regeneration via `protobuf-native`, the standard Yocto pattern; the checked-in 21.12 gencode is desktop/CI-only and **must not** ship to target |
+
+The M8 `meta-egrpc` recipe therefore regenerates all message gencode from the
+`.proto` files at build time with `protobuf-native` (which bitbake keeps in
+lockstep with the target runtime); only stub gencode (`.grpc.pb.*`) uses the
+pinned plugin. This was validated analytically against scarthgap's recipe and
+protobuf's version guards (2026-07); the pre-M5 bitbake spike (design §8a)
+confirms it empirically.
+
+Open item (M4 CI wiring, extended to M8): the pinned `grpc_cpp_plugin`
+(built on protobuf 35.0) must accept the CodeGeneratorRequest produced by
+whichever protoc drives it — 21.12 on CI, 25.x inside the Yocto recipe.
+Verify per driver; if a driver's request is rejected, drive the plugin from
+the pinned protoc 35.0 instead (the plugin emits no message code, so the
+runtime match constraint does not apply to its output — only the `.pb.*`
+generation must use the runtime-matched protoc).
 
 ## Policy (design §4.5)
 

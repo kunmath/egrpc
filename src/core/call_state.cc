@@ -16,6 +16,8 @@ constexpr char kUserAgent[] = "grpc-c++-egrpc/0.1.0";
 // constants; kept local so this file does not include nghttp2 headers).
 constexpr uint32_t kHttp2RefusedStream = 0x7;
 constexpr uint32_t kHttp2Cancel = 0x8;
+constexpr uint32_t kHttp2EnhanceYourCalm = 0xb;
+constexpr uint32_t kHttp2InadequateSecurity = 0xc;
 
 bool IsGrpcContentType(const std::string& value) {
   return value.compare(0, 16, "application/grpc") == 0;
@@ -201,7 +203,8 @@ void CallState::FinalizeLocked(uint32_t http2_error_code) {
   if (grpc_status_raw_.has_value()) {
     StatusCode code;
     if (!ParseGrpcStatus(*grpc_status_raw_, &code)) {
-      result_.code = StatusCode::kInternal;
+      // Upstream maps an unparseable grpc-status to UNKNOWN, not INTERNAL.
+      result_.code = StatusCode::kUnknown;
       result_.message = "malformed grpc-status trailer: \"" + *grpc_status_raw_ + "\"";
       return;
     }
@@ -237,8 +240,9 @@ void CallState::FinalizeLocked(uint32_t http2_error_code) {
     return;
   }
   switch (http2_error_code) {
-    case 0:  // NO_ERROR: clean close without grpc-status is a spec violation
-      result_.code = StatusCode::kInternal;
+    case 0:  // NO_ERROR: clean close without grpc-status falls back to the
+             // HTTP-status mapping, and 200 maps to UNKNOWN (upstream §5.5).
+      result_.code = StatusCode::kUnknown;
       result_.message = "server closed stream without grpc-status";
       return;
     case kHttp2RefusedStream:
@@ -248,6 +252,14 @@ void CallState::FinalizeLocked(uint32_t http2_error_code) {
     case kHttp2Cancel:
       result_.code = StatusCode::kCancelled;
       result_.message = "stream cancelled by server (RST_STREAM CANCEL)";
+      return;
+    case kHttp2EnhanceYourCalm:
+      result_.code = StatusCode::kResourceExhausted;
+      result_.message = "stream reset by server (RST_STREAM ENHANCE_YOUR_CALM)";
+      return;
+    case kHttp2InadequateSecurity:
+      result_.code = StatusCode::kPermissionDenied;
+      result_.message = "stream reset by server (RST_STREAM INADEQUATE_SECURITY)";
       return;
     default:
       result_.code = StatusCode::kInternal;

@@ -235,6 +235,12 @@ int32_t Http2Session::SubmitUnaryRequest(const HeaderList& headers, std::string 
   return stream_id;
 }
 
+uint32_t Http2Session::remote_max_concurrent_streams() const {
+  if (session_ == nullptr) return 0;
+  return nghttp2_session_get_remote_settings(const_cast<nghttp2_session*>(session_),
+                                             NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS);
+}
+
 const uint8_t* Http2Session::PendingOutput(size_t* len) {
   if (session_ == nullptr) {
     *len = 0;

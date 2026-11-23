@@ -14,6 +14,7 @@ asserted from the STATUS line.
 """
 
 import os
+import re
 import subprocess
 
 import pytest
@@ -164,6 +165,26 @@ def test_connection_reuse_three_calls(unary_bin, certs, route_guide_server):
     assert len(feature_lines) == 3, _fail_msg(result)
 
 
+def test_deadline_expired_before_submit_fails_locally(
+    unary_bin, certs, route_guide_server
+):
+    """grpc-timeout is computed when HEADERS are built on the EventThread,
+    not at call entry. --timeout-ms 0 sets a deadline that has always
+    expired by the time the connect completes and the call reaches
+    submission, so it must fail locally with DEADLINE_EXCEEDED (4) and
+    never produce a response."""
+    result = _run_probe(
+        unary_bin, certs, route_guide_server.port,
+        "--latitude", "1000", "--longitude", "2000", "--timeout-ms", "0",
+    )
+    assert result.returncode == 0, _fail_msg(result)
+    lines = result.stdout.splitlines()
+    assert "STATUS code=4 message=Deadline Exceeded" in lines, _fail_msg(result)
+    assert not any(
+        ln.startswith("FEATURE ") for ln in lines
+    ), _fail_msg(result)
+
+
 def test_deadline_header_does_not_break_server(
     unary_bin, certs, route_guide_server
 ):
@@ -177,3 +198,27 @@ def test_deadline_header_does_not_break_server(
     assert (
         "FEATURE name=egrpc-test-feature latitude=1000 longitude=2000" in lines
     ), _fail_msg(result)
+
+
+def test_concurrent_stream_cap_enforced(unary_bin, certs, route_guide_server):
+    """ChannelImpl admits at most min(local max_concurrent_streams,
+    server-advertised MAX_CONCURRENT_STREAMS) calls at once; excess calls
+    queue and are submitted as slots free. With a local cap of 2 and six
+    calls that each sleep 0.5 s on the server, the observed high-water mark
+    of concurrently active calls (max_active_calls) must be exactly 2."""
+    result = _run_probe(
+        unary_bin, certs, route_guide_server.port,
+        "--latitude", "-5", "--parallel", "6", "--max-streams", "2",
+        "--timeout-ms", "30000",
+    )
+    assert result.returncode == 0, _fail_msg(result)
+    lines = result.stdout.splitlines()
+
+    status_ok = [ln for ln in lines if ln == "STATUS code=0 message="]
+    assert len(status_ok) == 6, _fail_msg(result)
+
+    max_lines = [ln for ln in lines if re.fullmatch(r"MAXACTIVE n=\d+", ln)]
+    assert len(max_lines) == 1, _fail_msg(result)
+    max_active = int(max_lines[0].split("=", 1)[1])
+    # 0.5 s server sleep guarantees ≥2 overlapping calls; the cap guarantees ≤2.
+    assert max_active == 2, _fail_msg(result)

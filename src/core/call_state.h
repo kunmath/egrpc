@@ -99,8 +99,9 @@ class CallState {
 
   // Computes the final status per §5.5 (caller holds mu_, state != kClosed):
   // scanner protocol error > grpc-status (wins when present) > HTTP-status
-  // mapping > RST error code > missing grpc-status → kInternal. On kOk
-  // enforces exactly one response message (unary).
+  // mapping > RST error code > missing grpc-status on clean close → kUnknown
+  // (upstream's 200 → UNKNOWN fallback). On kOk enforces exactly one
+  // response message (unary).
   void FinalizeLocked(uint32_t http2_error_code);
   // → CLOSED; wakes the waiter. Caller holds mu_.
   void CloseLocked();

@@ -13,6 +13,7 @@ add_executable(egrpc_unit_tests
   test_event_thread.cc
   test_http2_session.cc
   test_grpc_wire.cc
+  test_call_state.cc
   test_call_headers.cc
   test_shim_stubs.cc
 )
