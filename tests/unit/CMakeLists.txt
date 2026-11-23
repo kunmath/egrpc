@@ -21,6 +21,7 @@ add_executable(egrpc_unit_tests
   test_dns_resolver.cc
   test_log.cc
   test_channel_config.cc
+  test_resilient_stream.cc
 )
 
 target_include_directories(egrpc_unit_tests SYSTEM PRIVATE

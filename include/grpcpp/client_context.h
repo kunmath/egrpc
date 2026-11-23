@@ -140,6 +140,11 @@ class ClientContextAccess {
   static void MarkInitialMetadataReceived(ClientContext* context) {
     if (context != nullptr) context->egrpc_initial_metadata_received_ = true;
   }
+  // Test seam: binds a TryCancel() hook so fake readers can observe
+  // cancellation. Returns true if TryCancel() was already requested.
+  static bool BindCancel(ClientContext* context, std::function<void()> fn) {
+    return context != nullptr && context->BindCancel(std::move(fn));
+  }
 };
 
 }  // namespace internal
