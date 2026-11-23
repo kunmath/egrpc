@@ -33,6 +33,7 @@
 #include <poll.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -40,9 +41,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <deque>
 #include <memory>
-#include <mutex>
 #include <set>
 #include <string>
 #include <thread>
@@ -181,17 +180,56 @@ egrpc::ChannelConfig MakeConfig(const Args& a) {
   return cfg;
 }
 
-// Bounded in-memory log capture. The sink may run on a channel's EventThread,
-// so it only takes a short lock and never touches stdio; overflow is dropped.
-struct CapturedLog {
-  egrpc::LogLevel level;
-  std::string component;
-  std::string message;
+// Fixed-capacity log capture. The sink may run on a channel's EventThread,
+// so Push() is lock-free and allocation-free: it reserves a preallocated slot
+// atomically, truncates into fixed buffers, and drops overflow.
+class LogCapture {
+ public:
+  void Push(egrpc::LogLevel level, const char* component, const std::string& message) {
+    const size_t idx = next_slot_.fetch_add(1, std::memory_order_relaxed);
+    if (idx >= kMaxEntries) {
+      dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    Slot& slot = slots_[idx];
+    slot.level = level;
+    CopyTruncated(slot.component, sizeof(slot.component), component, std::strlen(component));
+    CopyTruncated(slot.message, sizeof(slot.message), message.data(), message.size());
+    slot.ready.store(true, std::memory_order_release);
+  }
+
+  // Main thread only, after the sink is uninstalled.
+  void Flush() const {
+    const size_t n = std::min(next_slot_.load(std::memory_order_acquire), kMaxEntries);
+    for (size_t i = 0; i < n; ++i) {
+      const Slot& slot = slots_[i];
+      if (!slot.ready.load(std::memory_order_acquire)) continue;
+      std::printf("LOG level=%s comp=%s msg=%s\n", egrpc::LogLevelName(slot.level), slot.component,
+                  slot.message);
+    }
+    std::printf("LOGS_DROPPED=%zu\n", dropped_.load(std::memory_order_relaxed));
+  }
+
+ private:
+  static constexpr size_t kMaxEntries = 256;
+
+  struct Slot {
+    egrpc::LogLevel level = egrpc::LogLevel::kOff;
+    char component[32] = {};
+    char message[256] = {};
+    std::atomic<bool> ready{false};
+  };
+
+  static void CopyTruncated(char* dst, size_t cap, const char* src, size_t len) {
+    const size_t n = std::min(len, cap - 1);
+    std::memcpy(dst, src, n);
+    dst[n] = '\0';
+  }
+
+  Slot slots_[kMaxEntries];
+  std::atomic<size_t> next_slot_{0};
+  std::atomic<size_t> dropped_{0};
 };
-constexpr size_t kMaxCapturedLogs = 256;
-std::mutex g_log_mu;
-std::deque<CapturedLog> g_logs;
-size_t g_logs_dropped = 0;
 
 std::string Target(const Args& a) { return a.host + ":" + std::to_string(a.port); }
 
@@ -347,14 +385,12 @@ int main(int argc, char** argv) {
   Args a;
   if (!ParseArgs(argc, argv, &a)) return 2;
 
+  // Shared ownership keeps the capture alive for any late sink call.
+  std::shared_ptr<LogCapture> capture;
   if (a.capture_logs) {
-    egrpc::SetLogSink([](egrpc::LogLevel level, const char* comp, const std::string& msg) {
-      std::lock_guard<std::mutex> lock(g_log_mu);
-      if (g_logs.size() >= kMaxCapturedLogs) {
-        ++g_logs_dropped;
-        return;
-      }
-      g_logs.push_back(CapturedLog{level, comp, msg});
+    capture = std::make_shared<LogCapture>();
+    egrpc::SetLogSink([capture](egrpc::LogLevel level, const char* comp, const std::string& msg) {
+      capture->Push(level, comp, msg);
     });
   }
 
@@ -373,12 +409,7 @@ int main(int argc, char** argv) {
     // Every channel is destroyed by now (its EventThread joined), so no sink
     // call can race with this drain.
     egrpc::SetLogSink(nullptr);
-    std::lock_guard<std::mutex> lock(g_log_mu);
-    for (const CapturedLog& l : g_logs) {
-      std::printf("LOG level=%s comp=%s msg=%s\n", egrpc::LogLevelName(l.level),
-                  l.component.c_str(), l.message.c_str());
-    }
-    std::printf("LOGS_DROPPED=%zu\n", g_logs_dropped);
+    capture->Flush();
   }
   if (rc == 0) std::printf("DONE=1\n");
   return rc;
