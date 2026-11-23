@@ -19,6 +19,7 @@ namespace grpc {
 class Channel;
 namespace internal {
 class ClientStreamRawImpl;
+class ClientContextAccess;
 }  // namespace internal
 
 class ClientContext {
@@ -42,10 +43,12 @@ class ClientContext {
     send_initial_metadata_.emplace(key, value);
   }
 
-  // Stored for upstream parity; not honored until the M6 connectivity FSM
-  // (M3-core semantics apply: calls queue while connecting, fail once the
-  // channel has failed).
+  // Wait-for-ready (design §4.4): when true, the call queues through
+  // TRANSIENT_FAILURE / backoff / reconnect (and a GOAWAY drain) instead of
+  // failing fast with UNAVAILABLE; it still honors the deadline and
+  // TryCancel(). Default false (fail-fast), matching upstream.
   void set_wait_for_ready(bool wait_for_ready) { wait_for_ready_ = wait_for_ready; }
+  bool wait_for_ready() const { return wait_for_ready_; }
 
   // Requests cancellation of this RPC (design §5.6, §5.7). Thread-safe and
   // idempotent; legal before the call begins or concurrently from another
@@ -74,11 +77,18 @@ class ClientContext {
     return recv_trailing_view_;
   }
 
+  // --- egrpc internal (M6/M7) ----------------------------------------------
+  // True when the completed call's terminal status originated locally
+  // (TryCancel, local deadline, transport teardown, shutdown) rather than
+  // from the server (trailers grpc-status, HTTP status, server RST_STREAM).
+  bool egrpc_status_is_local() const { return egrpc_status_is_local_; }
+
  private:
   // grpc::Channel and ClientStreamRawImpl are the shim's call drivers: they
   // consume the send side, bind TryCancel, and deposit received metadata.
   friend class grpc::Channel;
   friend class grpc::internal::ClientStreamRawImpl;
+  friend class grpc::internal::ClientContextAccess;
 
   // Binds a cancel action for an in-flight call. Returns true if TryCancel()
   // was already invoked on this context before the call started.
@@ -97,6 +107,7 @@ class ClientContext {
 
   std::chrono::system_clock::time_point deadline_ = std::chrono::system_clock::time_point::max();
   bool wait_for_ready_ = false;
+  bool egrpc_status_is_local_ = false;
   std::multimap<std::string, std::string> send_initial_metadata_;
 
   // Received metadata storage + views into it. multimap nodes are stable,
@@ -113,4 +124,16 @@ class ClientContext {
   std::shared_ptr<std::function<void()>> cancel_fn_;
 };
 
+namespace internal {
+
+// Lets the shim's header templates (which serialize/deserialize messages
+// before/after the byte-level call) flag their locally-generated failures.
+class ClientContextAccess {
+ public:
+  static void MarkStatusLocal(ClientContext* context) {
+    if (context != nullptr) context->egrpc_status_is_local_ = true;
+  }
+};
+
+}  // namespace internal
 }  // namespace grpc

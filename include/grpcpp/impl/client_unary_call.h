@@ -6,6 +6,7 @@
 // §4.5's "thin shim entry points").
 #pragma once
 
+#include <grpcpp/client_context.h>
 #include <grpcpp/impl/proto_utils.h>
 #include <grpcpp/support/status.h>
 
@@ -42,13 +43,18 @@ Status BlockingUnaryCall(ChannelInterface* channel, const RpcMethod& method, Cli
 
   std::string request_bytes;
   Status s = SerializationTraits<BaseInputMessage>::Serialize(request, &request_bytes);
-  if (!s.ok()) return s;
+  if (!s.ok()) {
+    ClientContextAccess::MarkStatusLocal(context);
+    return s;
+  }
 
   std::string response_bytes;
   s = BlockingUnaryCallRaw(channel, method, context, request_bytes, &response_bytes);
   if (!s.ok()) return s;
 
-  return SerializationTraits<BaseOutputMessage>::Deserialize(response_bytes, result);
+  s = SerializationTraits<BaseOutputMessage>::Deserialize(response_bytes, result);
+  if (!s.ok()) ClientContextAccess::MarkStatusLocal(context);
+  return s;
 }
 
 }  // namespace internal

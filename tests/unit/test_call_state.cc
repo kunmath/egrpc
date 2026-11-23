@@ -30,6 +30,7 @@ using egrpc::internal::CallCompletion;
 using egrpc::internal::CallMode;
 using egrpc::internal::CallState;
 using egrpc::internal::StatusCode;
+using egrpc::internal::StatusOrigin;
 using HeaderList = egrpc::internal::Http2Session::HeaderList;
 
 constexpr size_t kMax = 4 * 1024 * 1024;
@@ -692,5 +693,273 @@ TEST_SUITE("call_state") {
     call.OnClose(0);
     CHECK_FALSE(completion->PopMessage(&payload, &wire_bytes));
     CHECK(call.Wait().code == StatusCode::kOk);
+  }
+
+  // --- StatusOrigin (design §4.6: resilient_stream must distinguish a
+  // locally-originated CANCELLED from a server-originated one) -------------
+
+  TEST_CASE("StatusOrigin: server trailers grpc-status 0 is kServer") {
+    SUBCASE("unary with one response message") {
+      CallState call(kMax);
+      call.OnResponseHeaders({{":status", "200"}, {"content-type", "application/grpc"}},
+                             /*end_stream=*/false);
+      FeedData(&call, Frame("ok"));
+      call.OnTrailers({{"grpc-status", "0"}});
+      call.OnClose(0);
+
+      const CallState::Result& r = call.Wait();
+      CHECK(r.code == StatusCode::kOk);
+      CHECK(r.response == "ok");
+      CHECK(r.origin == StatusOrigin::kServer);
+    }
+
+    SUBCASE("server streaming") {
+      auto completion = std::make_shared<CallCompletion>();
+      CallState call(kMax, CallMode::kServerStreaming, completion, 16, kMax);
+      call.OnResponseHeaders({{":status", "200"}, {"content-type", "application/grpc"}},
+                             /*end_stream=*/false);
+      call.OnTrailers({{"grpc-status", "0"}});
+      call.OnClose(0);
+
+      const CallState::Result& r = completion->Wait();
+      CHECK(r.code == StatusCode::kOk);
+      CHECK(r.origin == StatusOrigin::kServer);
+    }
+  }
+
+  TEST_CASE("StatusOrigin: server trailers grpc-status 1 is kCancelled from kServer") {
+    auto completion = std::make_shared<CallCompletion>();
+    CallState call(kMax, CallMode::kServerStreaming, completion, 16, kMax);
+    call.OnResponseHeaders({{":status", "200"}, {"content-type", "application/grpc"}},
+                           /*end_stream=*/false);
+    call.OnTrailers({{"grpc-status", "1"}, {"grpc-message", "server%20cancelled"}});
+    call.OnClose(0);
+
+    const CallState::Result& r = completion->Wait();
+    CHECK(r.code == StatusCode::kCancelled);
+    CHECK(r.message == "server cancelled");
+    CHECK(r.origin == StatusOrigin::kServer);
+  }
+
+  TEST_CASE("StatusOrigin: trailers-only grpc-status 1 is kCancelled from kServer") {
+    SUBCASE("unary") {
+      CallState call(kMax);
+      call.OnResponseHeaders(
+          {{":status", "200"}, {"content-type", "application/grpc"}, {"grpc-status", "1"}},
+          /*end_stream=*/true);
+      call.OnClose(0);
+
+      const CallState::Result& r = call.Wait();
+      CHECK(r.code == StatusCode::kCancelled);
+      CHECK(r.origin == StatusOrigin::kServer);
+    }
+
+    SUBCASE("server streaming") {
+      auto completion = std::make_shared<CallCompletion>();
+      CallState call(kMax, CallMode::kServerStreaming, completion, 16, kMax);
+      call.OnResponseHeaders(
+          {{":status", "200"}, {"content-type", "application/grpc"}, {"grpc-status", "1"}},
+          /*end_stream=*/true);
+      call.OnClose(0);
+
+      const CallState::Result& r = completion->Wait();
+      CHECK(r.code == StatusCode::kCancelled);
+      CHECK(r.origin == StatusOrigin::kServer);
+    }
+  }
+
+  TEST_CASE("StatusOrigin: server RST_STREAM(CANCEL) without trailers is kCancelled from kServer") {
+    SUBCASE("before any response headers") {
+      CallState call(kMax);
+      call.OnClose(egrpc::internal::Http2Session::kHttp2Cancel);
+
+      const CallState::Result& r = call.Wait();
+      CHECK(r.code == StatusCode::kCancelled);
+      CHECK(r.origin == StatusOrigin::kServer);
+    }
+
+    SUBCASE("after 200 response headers on a streaming call") {
+      auto completion = std::make_shared<CallCompletion>();
+      CallState call(kMax, CallMode::kServerStreaming, completion, 16, kMax);
+      call.OnResponseHeaders({{":status", "200"}, {"content-type", "application/grpc"}},
+                             /*end_stream=*/false);
+      call.OnClose(egrpc::internal::Http2Session::kHttp2Cancel);
+
+      const CallState::Result& r = completion->Wait();
+      CHECK(r.code == StatusCode::kCancelled);
+      CHECK(r.origin == StatusOrigin::kServer);
+    }
+  }
+
+  TEST_CASE("StatusOrigin: non-200 HTTP status fallback is kServer") {
+    CallState call(kMax);
+    call.OnResponseHeaders({{":status", "503"}, {"content-type", "text/plain"}},
+                           /*end_stream=*/false);
+    FeedData(&call, "service unavailable");
+    call.OnClose(0);
+
+    const CallState::Result& r = call.Wait();
+    CHECK(r.code == StatusCode::kUnavailable);
+    CHECK(r.origin == StatusOrigin::kServer);
+  }
+
+  TEST_CASE("StatusOrigin: FailLocal(kCancelled) is kCancelled from kLocal") {
+    auto completion = std::make_shared<CallCompletion>();
+    CallState call(kMax, CallMode::kServerStreaming, completion, 16, kMax);
+    call.OnResponseHeaders({{":status", "200"}, {"content-type", "application/grpc"}},
+                           /*end_stream=*/false);
+    call.FailLocal(StatusCode::kCancelled, "Cancelled");
+    CHECK(call.is_closed());
+
+    // Late server events after local close must not rewrite the result.
+    call.OnTrailers({{"grpc-status", "0"}});
+    call.OnClose(0);
+
+    const CallState::Result& r = completion->Wait();
+    CHECK(r.code == StatusCode::kCancelled);
+    CHECK(r.message == "Cancelled");
+    CHECK(r.origin == StatusOrigin::kLocal);
+  }
+
+  TEST_CASE("StatusOrigin: TryPreemptTerminal after RequestCancel is kCancelled from kLocal") {
+    auto completion = std::make_shared<CallCompletion>();
+    CallState call(kMax, CallMode::kServerStreaming, completion, 16, kMax);
+    call.OnResponseHeaders({{":status", "200"}, {"content-type", "application/grpc"}},
+                           /*end_stream=*/false);
+    REQUIRE(completion->RequestCancel());
+
+    CHECK(call.TryPreemptTerminal());
+    CHECK(call.is_closed());
+    // The wire close that follows must be a no-op.
+    call.OnClose(0);
+
+    const CallState::Result& r = completion->Wait();
+    CHECK(r.code == StatusCode::kCancelled);
+    CHECK(r.origin == StatusOrigin::kLocal);
+  }
+
+  TEST_CASE("StatusOrigin: TryPreemptTerminal after elapsed deadline is kDeadlineExceeded/kLocal") {
+    auto completion = std::make_shared<CallCompletion>();
+    CallState call(kMax, CallMode::kServerStreaming, completion, 16, kMax);
+    call.set_deadline(std::chrono::steady_clock::now() - std::chrono::milliseconds(1));
+    call.OnResponseHeaders({{":status", "200"}, {"content-type", "application/grpc"}},
+                           /*end_stream=*/false);
+
+    CHECK(call.TryPreemptTerminal());
+    CHECK(call.is_closed());
+    call.OnClose(0);
+
+    const CallState::Result& r = completion->Wait();
+    CHECK(r.code == StatusCode::kDeadlineExceeded);
+    CHECK(r.origin == StatusOrigin::kLocal);
+  }
+
+  TEST_CASE("StatusOrigin: TryPreemptTerminal without cancel or elapsed deadline keeps kServer") {
+    // Edge case: no preemption → returns false, call stays live, and the
+    // server's later status (even CANCELLED) is attributed to the server.
+    auto completion = std::make_shared<CallCompletion>();
+    CallState call(kMax, CallMode::kServerStreaming, completion, 16, kMax);
+    call.set_deadline(std::chrono::steady_clock::now() + std::chrono::hours(1));
+    call.OnResponseHeaders({{":status", "200"}, {"content-type", "application/grpc"}},
+                           /*end_stream=*/false);
+
+    CHECK_FALSE(call.TryPreemptTerminal());
+    CHECK_FALSE(call.is_closed());
+
+    call.OnTrailers({{"grpc-status", "1"}});
+    call.OnClose(0);
+
+    const CallState::Result& r = completion->Wait();
+    CHECK(r.code == StatusCode::kCancelled);
+    CHECK(r.origin == StatusOrigin::kServer);
+  }
+
+  TEST_CASE("StatusOrigin: TryPreemptTerminal never overwrites an already-closed server status") {
+    // Edge case: cancel requested after the server already closed the call;
+    // the server-originated status and origin must stand.
+    auto completion = std::make_shared<CallCompletion>();
+    CallState call(kMax, CallMode::kServerStreaming, completion, 16, kMax);
+    call.OnResponseHeaders(
+        {{":status", "200"}, {"content-type", "application/grpc"}, {"grpc-status", "1"}},
+        /*end_stream=*/true);
+    call.OnClose(0);
+    REQUIRE(call.is_closed());
+
+    REQUIRE(completion->RequestCancel());
+    CHECK_FALSE(call.TryPreemptTerminal());
+    call.FailLocal(StatusCode::kCancelled, "Cancelled");
+
+    const CallState::Result& r = completion->Wait();
+    CHECK(r.code == StatusCode::kCancelled);
+    CHECK(r.origin == StatusOrigin::kServer);
+  }
+
+  TEST_CASE("StatusOrigin: local framing violations are kLocal") {
+    SUBCASE("compressed flag = 1 fails with kInternal") {
+      int protocol_errors = 0;
+      CallState::Hooks hooks;
+      hooks.on_protocol_error = [&] { ++protocol_errors; };
+      auto completion = std::make_shared<CallCompletion>();
+      CallState call(kMax, CallMode::kServerStreaming, completion, 16, kMax, std::move(hooks));
+      call.OnResponseHeaders({{":status", "200"}, {"content-type", "application/grpc"}},
+                             /*end_stream=*/false);
+      FeedData(&call, RawPrefix(/*flag=*/1, /*declared_len=*/1) + "x");
+
+      CHECK(call.is_closed());
+      CHECK(protocol_errors == 1);
+      // Server trailers arriving afterwards must not flip origin to kServer.
+      call.OnTrailers({{"grpc-status", "0"}});
+      call.OnClose(0);
+
+      const CallState::Result& r = completion->Wait();
+      CHECK(r.code == StatusCode::kInternal);
+      CHECK(r.origin == StatusOrigin::kLocal);
+    }
+
+    SUBCASE("oversize message fails with kResourceExhausted") {
+      int protocol_errors = 0;
+      CallState::Hooks hooks;
+      hooks.on_protocol_error = [&] { ++protocol_errors; };
+      CallState call(/*max_receive_message_size=*/16, CallMode::kUnary, nullptr, 16, kMax,
+                     std::move(hooks));
+      call.OnResponseHeaders({{":status", "200"}, {"content-type", "application/grpc"}},
+                             /*end_stream=*/false);
+      FeedData(&call, RawPrefix(/*flag=*/0, /*declared_len=*/17));
+
+      CHECK(call.is_closed());
+      CHECK(protocol_errors == 1);
+      call.OnClose(0);
+
+      const CallState::Result& r = call.Wait();
+      CHECK(r.code == StatusCode::kResourceExhausted);
+      CHECK(r.origin == StatusOrigin::kLocal);
+    }
+
+    SUBCASE("truncated frame at clean close fails with kInternal") {
+      // Edge case: framing error detected only at finalize (no grpc-status).
+      CallState call(kMax);
+      call.OnResponseHeaders({{":status", "200"}, {"content-type", "application/grpc"}},
+                             /*end_stream=*/false);
+      FeedData(&call, RawPrefix(/*flag=*/0, /*declared_len=*/10) + "abc");
+      call.OnClose(0);
+
+      const CallState::Result& r = call.Wait();
+      CHECK(r.code == StatusCode::kInternal);
+      CHECK(r.origin == StatusOrigin::kLocal);
+    }
+
+    SUBCASE("unary grpc-status 0 without a response message fails with kInternal") {
+      // Edge case: the server said OK, but the client rejects the protocol
+      // violation locally.
+      CallState call(kMax);
+      call.OnResponseHeaders({{":status", "200"}, {"content-type", "application/grpc"}},
+                             /*end_stream=*/false);
+      call.OnTrailers({{"grpc-status", "0"}});
+      call.OnClose(0);
+
+      const CallState::Result& r = call.Wait();
+      CHECK(r.code == StatusCode::kInternal);
+      CHECK(r.origin == StatusOrigin::kLocal);
+    }
   }
 }  // TEST_SUITE("call_state")

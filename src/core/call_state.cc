@@ -320,6 +320,7 @@ void CallState::FailLocal(StatusCode code, std::string message) {
   Result result;
   result.code = code;
   result.message = std::move(message);
+  result.origin = StatusOrigin::kLocal;
   state_ = State::kClosed;
   completion_->Close(std::move(result), /*discard_queued=*/true);
 }
@@ -346,6 +347,7 @@ void CallState::FinalizeAndClose(uint32_t http2_error_code, bool discard_queued)
   if (scanner_.failed()) {
     result.code = scanner_.error_code();
     result.message = scanner_.error();
+    result.origin = StatusOrigin::kLocal;
   } else if (grpc_status_raw_.has_value()) {
     // Trailers carrying grpc-status win over everything else (§5.5).
     StatusCode code;
@@ -360,14 +362,17 @@ void CallState::FinalizeAndClose(uint32_t http2_error_code, bool discard_queued)
         if (scanner_.HasPartialMessage()) {
           result.code = StatusCode::kInternal;
           result.message = "stream ended mid-message (truncated gRPC frame)";
+          result.origin = StatusOrigin::kLocal;
         } else if (mode_ == CallMode::kUnary) {
           // OK unary calls must deliver exactly one complete response message.
           if (response_count_ == 0) {
             result.code = StatusCode::kInternal;
             result.message = "unary call completed with OK status but no response message";
+            result.origin = StatusOrigin::kLocal;
           } else if (response_count_ > 1) {
             result.code = StatusCode::kInternal;
             result.message = "unary call received more than one response message";
+            result.origin = StatusOrigin::kLocal;
           } else {
             result.response = std::move(first_response_);
           }
@@ -410,6 +415,7 @@ void CallState::FinalizeAndClose(uint32_t http2_error_code, bool discard_queued)
     // Clean close mid-message without grpc-status is a framing error.
     result.code = StatusCode::kInternal;
     result.message = "stream ended mid-message (truncated gRPC frame)";
+    result.origin = StatusOrigin::kLocal;
   } else {
     // Clean close without grpc-status (HTTP 200 maps to UNKNOWN per §5.5).
     result.code = StatusCode::kUnknown;

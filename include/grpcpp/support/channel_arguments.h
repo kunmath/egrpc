@@ -1,6 +1,7 @@
 // egrpc grpcpp shim — grpc::ChannelArguments (design §4.5): accept-and-
 // ignore unknown args; CreateCustomChannel honors the keepalive args
-// (§5.2), the max message sizes, and the primary user-agent prefix. The
+// (§5.2), the reconnect backoff args (§5.3), the max message sizes, and the
+// primary user-agent prefix. The
 // GRPC_ARG_* names are upstream's channel-arg keys (normally from
 // grpc/impl/channel_arg_names.h), defined here so user code compiles
 // unchanged.
@@ -17,6 +18,15 @@
 #endif
 #ifndef GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS
 #define GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS "grpc.keepalive_permit_without_calls"
+#endif
+#ifndef GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS
+#define GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS "grpc.initial_reconnect_backoff_ms"
+#endif
+#ifndef GRPC_ARG_MIN_RECONNECT_BACKOFF_MS
+#define GRPC_ARG_MIN_RECONNECT_BACKOFF_MS "grpc.min_reconnect_backoff_ms"
+#endif
+#ifndef GRPC_ARG_MAX_RECONNECT_BACKOFF_MS
+#define GRPC_ARG_MAX_RECONNECT_BACKOFF_MS "grpc.max_reconnect_backoff_ms"
 #endif
 #ifndef GRPC_ARG_MAX_RECEIVE_MESSAGE_LENGTH
 #define GRPC_ARG_MAX_RECEIVE_MESSAGE_LENGTH "grpc.max_receive_message_length"

@@ -3,7 +3,6 @@
 #include "transport/tls_socket.h"
 
 #include <arpa/inet.h>
-#include <netdb.h>
 #include <netinet/tcp.h>
 #include <openssl/err.h>
 #include <openssl/pem.h>
@@ -125,44 +124,65 @@ bool TlsSocket::CreateSslContext(const TlsConfig& config) {
   return true;
 }
 
+namespace {
+
+uint16_t PortOf(const ResolvedAddress& ra) {
+  if (ra.addr.ss_family == AF_INET && ra.len >= sizeof(sockaddr_in)) {
+    return ntohs(reinterpret_cast<const sockaddr_in*>(&ra.addr)->sin_port);
+  }
+  if (ra.addr.ss_family == AF_INET6 && ra.len >= sizeof(sockaddr_in6)) {
+    return ntohs(reinterpret_cast<const sockaddr_in6*>(&ra.addr)->sin6_port);
+  }
+  return 0;
+}
+
+}  // namespace
+
 bool TlsSocket::StartConnect(const std::string& host, uint16_t port, const TlsConfig& config) {
   if (state_ != State::kIdle) {
     Fail("StartConnect called twice on the same TlsSocket");
     return false;
   }
+  ResolveResult res = ResolveBlocking(host, port);
+  if (!res.ok()) {
+    Fail(res.error.empty() ? "resolution of '" + host + "' returned no usable addresses"
+                           : res.error);
+    return false;
+  }
+  return StartConnect(host, res.addresses, config);
+}
+
+bool TlsSocket::StartConnect(const std::string& host, const std::vector<ResolvedAddress>& addresses,
+                             const TlsConfig& config) {
+  if (state_ != State::kIdle) {
+    Fail("StartConnect called twice on the same TlsSocket");
+    return false;
+  }
+  if (addresses.empty()) {
+    Fail("no resolved addresses for '" + host + "'");
+    return false;
+  }
   host_ = host;
+  last_tls_error_.clear();
 
   if (!CreateSslContext(config)) {
     Fail(error_);
     return false;
   }
 
-  addrinfo hints{};
-  hints.ai_family = AF_UNSPEC;
-  hints.ai_socktype = SOCK_STREAM;
-  hints.ai_protocol = IPPROTO_TCP;
-  addrinfo* result = nullptr;
-  const std::string port_str = std::to_string(port);
-  const int rc = getaddrinfo(host.c_str(), port_str.c_str(), &hints, &result);
-  if (rc != 0) {
-    Fail("failed to resolve '" + host + "': " + gai_strerror(rc));
-    return false;
+  for (const ResolvedAddress& ra : addresses) {
+    if (ra.len == 0 || ra.len > sizeof(sockaddr_storage)) continue;
+    addresses_.push_back(ra.addr);
+    address_lens_.push_back(ra.len);
   }
-  for (addrinfo* ai = result; ai != nullptr; ai = ai->ai_next) {
-    if (ai->ai_addrlen > sizeof(sockaddr_storage)) continue;
-    sockaddr_storage ss{};
-    std::memcpy(&ss, ai->ai_addr, ai->ai_addrlen);
-    addresses_.push_back(ss);
-    address_lens_.push_back(ai->ai_addrlen);
-  }
-  freeaddrinfo(result);
   if (addresses_.empty()) {
-    Fail("resolution of '" + host + "' returned no usable addresses");
+    Fail("no usable resolved addresses for '" + host + "'");
     return false;
   }
 
   if (!TryNextAddress()) {
-    Fail("could not connect to '" + host + ":" + port_str + "': " + error_);
+    Fail("could not connect to '" + host + ":" + std::to_string(PortOf(addresses.front())) +
+         "': " + error_);
     return false;
   }
   return true;
@@ -211,6 +231,9 @@ TlsSocket::IoStatus TlsSocket::CheckTcpConnected() {
       // Moved on to the next resolved address; still connecting.
       return state_ == State::kTlsHandshake ? ContinueTlsHandshake() : IoStatus::kWantWrite;
     }
+    // An earlier address got as far as TLS: its handshake/ALPN error is more
+    // informative than this fallback address's connect() error.
+    if (!last_tls_error_.empty()) return Fail(last_tls_error_);
     return Fail("could not connect to '" + host_ + "': " + error_);
   }
   state_ = State::kTlsHandshake;
@@ -249,7 +272,7 @@ TlsSocket::IoStatus TlsSocket::ContinueTlsHandshake() {
     unsigned int proto_len = 0;
     SSL_get0_alpn_selected(ssl_, &proto, &proto_len);
     if (proto_len != 2 || std::memcmp(proto, "h2", 2) != 0) {
-      return Fail("server did not negotiate HTTP/2 via ALPN");
+      return HandleTlsFailure("server did not negotiate HTTP/2 via ALPN");
     }
     alpn_.assign(reinterpret_cast<const char*>(proto), proto_len);
     state_ = State::kConnected;
@@ -270,7 +293,8 @@ TlsSocket::IoStatus TlsSocket::ContinueTlsHandshake() {
   // specifically. A strict server rejects our h2-only offer with a fatal
   // no_application_protocol alert before the handshake completes.
   if (ERR_GET_REASON(ERR_peek_error()) == SSL_AD_REASON_OFFSET + TLS1_AD_NO_APPLICATION_PROTOCOL) {
-    return Fail("server did not negotiate HTTP/2 via ALPN");
+    ERR_clear_error();
+    return HandleTlsFailure("server did not negotiate HTTP/2 via ALPN");
   }
   const long verify = SSL_get_verify_result(ssl_);  // NOLINT(runtime/int)
   std::string detail = SslErrorQueueString();
@@ -282,7 +306,25 @@ TlsSocket::IoStatus TlsSocket::ContinueTlsHandshake() {
                  ? std::string("TLS handshake I/O error: ") + std::strerror(saved_errno)
                  : "connection closed during TLS handshake";
   }
-  return Fail("TLS handshake with '" + host_ + "' failed: " + detail);
+  return HandleTlsFailure("TLS handshake with '" + host_ + "' failed: " + detail);
+}
+
+TlsSocket::IoStatus TlsSocket::HandleTlsFailure(const std::string& detail) {
+  last_tls_error_ = detail;
+  // Per-attempt teardown only: ssl_ctx_ and the remaining addresses survive.
+  if (ssl_ != nullptr) {
+    SSL_free(ssl_);
+    ssl_ = nullptr;
+  }
+  if (fd_ >= 0) {
+    close(fd_);
+    fd_ = -1;
+  }
+  alpn_.clear();
+  if (TryNextAddress()) {
+    return state_ == State::kTlsHandshake ? ContinueTlsHandshake() : IoStatus::kWantWrite;
+  }
+  return Fail(last_tls_error_);
 }
 
 TlsSocket::IoStatus TlsSocket::ContinueConnect() {
@@ -354,7 +396,8 @@ TlsSocket::IoStatus TlsSocket::Write(const void* buf, size_t len, size_t* n) {
 }
 
 TlsSocket::IoStatus TlsSocket::Fail(const std::string& message) {
-  error_ = message;
+  error_ = message;  // copy first: `message` may alias last_tls_error_
+  last_tls_error_.clear();
   state_ = State::kFailed;
   desired_events_ = 0;
   if (ssl_ != nullptr) {
@@ -369,12 +412,16 @@ TlsSocket::IoStatus TlsSocket::Fail(const std::string& message) {
     close(fd_);
     fd_ = -1;
   }
+  addresses_.clear();
+  address_lens_.clear();
+  next_address_ = 0;
   return IoStatus::kError;
 }
 
-void TlsSocket::Close() {
+void TlsSocket::Close(bool graceful) {
   if (ssl_ != nullptr) {
-    if (state_ == State::kConnected) SSL_shutdown(ssl_);  // best-effort, one try
+    // Best-effort, one try; skipped on abortive close (pending SSL operation).
+    if (graceful && state_ == State::kConnected) SSL_shutdown(ssl_);
     SSL_free(ssl_);
     ssl_ = nullptr;
   }
@@ -386,6 +433,10 @@ void TlsSocket::Close() {
     close(fd_);
     fd_ = -1;
   }
+  addresses_.clear();
+  address_lens_.clear();
+  next_address_ = 0;
+  last_tls_error_.clear();
   if (state_ != State::kFailed) state_ = State::kClosed;
   desired_events_ = 0;
 }

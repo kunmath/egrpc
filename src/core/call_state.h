@@ -58,6 +58,13 @@ Http2Session::HeaderList BuildRequestHeaders(const std::string& authority,
 
 enum class CallMode { kUnary, kServerStreaming };
 
+// Where a call's terminal status came from (design §4.6: resilient_stream
+// must tell a locally-originated CANCELLED from a server-originated one).
+enum class StatusOrigin {
+  kServer,  // server trailers (grpc-status), HTTP status mapping, or server RST_STREAM
+  kLocal,   // local TryCancel, local deadline, framing violation, transport teardown, shutdown
+};
+
 // Caller-shared completion block (design §5.7). Holds no transport references;
 // every member is synchronized by mu_.
 class CallCompletion {
@@ -72,6 +79,7 @@ class CallCompletion {
     // metadata is trailing, matching upstream.
     Http2Session::HeaderList initial_metadata;
     Http2Session::HeaderList trailing_metadata;
+    StatusOrigin origin = StatusOrigin::kServer;
   };
 
   struct QueuedMessage {

@@ -16,6 +16,8 @@
 #include <string>
 #include <vector>
 
+#include "transport/dns_resolver.h"
+
 // Forward-declare OpenSSL types so this header does not leak <openssl/*.h>.
 typedef struct ssl_ctx_st SSL_CTX;
 typedef struct ssl_st SSL;
@@ -63,14 +65,22 @@ class TlsSocket {
   TlsSocket(const TlsSocket&) = delete;
   TlsSocket& operator=(const TlsSocket&) = delete;
 
-  // Resolves host (blocking getaddrinfo — acceptable only while transport
-  // failure is channel-terminal, i.e. through M5; design §4.1 moves
-  // resolution to a helper thread with generation-tagged results before M6's
-  // reconnect, after which Connect takes pre-resolved addresses) and starts
-  // a non-blocking connect to the first address; remaining addresses are
-  // fallbacks tried on connect failure. Returns false and sets state kFailed
-  // on immediate failure (resolution, socket creation, or CA/cert config
-  // errors).
+  // Starts a non-blocking connect to the first of `addresses` (pre-resolved
+  // by DnsResolver on its helper thread, design §4.1); remaining addresses
+  // are fallbacks tried on TCP connect failure and on TLS handshake / ALPN
+  // failure (fd() may then change; owners must re-watch it). When every
+  // address fails, the most informative TLS/ALPN error seen is reported. `host` is used for SNI and
+  // certificate hostname verification. Returns false and sets state kFailed
+  // on immediate failure (empty address list, socket creation, or CA/cert
+  // config errors). This is the overload M6's ChannelImpl uses.
+  bool StartConnect(const std::string& host, const std::vector<ResolvedAddress>& addresses,
+                    const TlsConfig& config);
+
+  // Blocking convenience wrapper for standalone probes and tests (the M1/M2
+  // tls_connect / h2_keepalive probes): resolves host:port with a blocking
+  // getaddrinfo (ResolveBlocking) on the calling thread, then delegates to
+  // the pre-resolved overload. Never use it on a reconnecting channel's
+  // EventThread.
   bool StartConnect(const std::string& host, uint16_t port, const TlsConfig& config);
 
   // Drives TCP connect + TLS handshake. Call after StartConnect() and then
@@ -85,9 +95,12 @@ class TlsSocket {
   IoStatus Read(void* buf, size_t len, size_t* n);
   IoStatus Write(const void* buf, size_t len, size_t* n);
 
-  // Best-effort close: one non-blocking SSL_shutdown attempt, then close(2).
-  // Idempotent. (Design §5.7: bounded, never hangs.)
-  void Close();
+  // Best-effort close: one non-blocking SSL_shutdown attempt (graceful only),
+  // then close(2). Idempotent. (Design §5.7: bounded, never hangs.) Pass
+  // graceful=false when an SSL_read_ex/SSL_write_ex returned WANT_READ/
+  // WANT_WRITE and was never retried: OpenSSL forbids issuing another
+  // operation (including SSL_shutdown) on it, so the close is abortive.
+  void Close(bool graceful = true);
 
   int fd() const { return fd_; }
   State state() const { return state_; }
@@ -103,6 +116,10 @@ class TlsSocket {
   bool TryNextAddress();
   IoStatus CheckTcpConnected();  // SO_ERROR check after POLLOUT
   IoStatus ContinueTlsHandshake();
+  // Handshake/ALPN failure on the current address: records `detail`, tears
+  // down only this attempt's SSL* and fd, and moves to the next address
+  // (Fail(detail) when none remain).
+  IoStatus HandleTlsFailure(const std::string& detail);
   IoStatus Fail(const std::string& message);  // → kFailed, closes fd
   // Maps an SSL_get_error result to an IoStatus; fills error_ on kError.
   IoStatus MapSslError(int ssl_error, int syscall_errno, const char* op);
@@ -114,6 +131,9 @@ class TlsSocket {
   std::string host_;  // for SNI + hostname verification
   bool verify_peer_ = true;
   std::string error_;
+  // Last TLS handshake/ALPN failure across fallback addresses; preferred
+  // over a later address's TCP error when all addresses are exhausted.
+  std::string last_tls_error_;
   std::string alpn_;
   short desired_events_ = 0;
 

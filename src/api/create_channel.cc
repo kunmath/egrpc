@@ -1,8 +1,9 @@
 // egrpc grpcpp shim — grpc::CreateChannel / CreateCustomChannel (design
 // §4.5). Maps credentials onto TlsConfig and the honored ChannelArguments
-// (keepalive §5.2, max receive size, primary user-agent) onto
-// ChannelOptions; everything unsupported yields a lame channel with a
-// descriptive status instead of failing at call time with less context.
+// (keepalive §5.2, reconnect backoff §5.3, max message sizes, primary
+// user-agent) onto ChannelOptions; everything unsupported yields a lame
+// channel with a descriptive status instead of failing at call time with
+// less context.
 
 #include <grpcpp/create_channel.h>
 
@@ -92,8 +93,8 @@ std::shared_ptr<Channel> CreateCustomChannel(const std::string& target,
   egrpc::internal::TlsConfig tls;
   tls.ca_bundle_pem = ssl.pem_root_certs;  // empty ⇒ system trust store
 
-  // Honored args (design §4.5): keepalive (§5.2), max receive size,
-  // primary user-agent. Everything else is accepted and ignored.
+  // Honored args (design §4.5): keepalive (§5.2), reconnect backoff (§5.3),
+  // max message sizes, primary user-agent. Everything else is accepted and ignored.
   egrpc::internal::ChannelOptions options;
   const auto& ints = args.egrpc_ints();
   auto int_arg = [&ints](const char* key) -> const int* {
@@ -108,6 +109,17 @@ std::shared_ptr<Channel> CreateCustomChannel(const std::string& target,
   }
   if (const int* v = int_arg(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS)) {
     options.http2.keepalive_permit_without_calls = (*v != 0);
+  }
+  // Reconnect backoff (§5.3). MIN_RECONNECT_BACKOFF is upstream's
+  // MIN_CONNECT_TIMEOUT, unified with connect_timeout in egrpc.
+  if (const int* v = int_arg(GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS); v && *v > 0) {
+    options.initial_reconnect_backoff = std::chrono::milliseconds(*v);
+  }
+  if (const int* v = int_arg(GRPC_ARG_MIN_RECONNECT_BACKOFF_MS); v && *v > 0) {
+    options.connect_timeout = std::chrono::milliseconds(*v);
+  }
+  if (const int* v = int_arg(GRPC_ARG_MAX_RECONNECT_BACKOFF_MS); v && *v > 0) {
+    options.max_reconnect_backoff = std::chrono::milliseconds(*v);
   }
   // Upstream's -1 means "unlimited"; egrpc keeps its bounded default
   // instead — the receive scanner needs a bound (design §4.3).

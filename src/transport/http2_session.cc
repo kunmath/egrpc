@@ -378,11 +378,14 @@ const uint8_t* Http2Session::PendingOutput(size_t* len) {
     *len = 0;
     return nullptr;
   }
-  // Refill only once the previously produced region has been fully consumed.
+  // Refill only once the previously produced region has been fully consumed
+  // (an SSL_write_ex retry must see the same buffer). Each refill is capped so
+  // a large peer flow-control window cannot make one call copy megabytes.
+  constexpr size_t kMaxRefillBytes = 64 * 1024;
   if (out_consumed_ >= out_.size()) {
     out_.clear();
     out_consumed_ = 0;
-    for (;;) {
+    while (out_.size() < kMaxRefillBytes) {
       const uint8_t* chunk = nullptr;
       const ssize_t n = nghttp2_session_mem_send(session_, &chunk);
       if (n < 0) {

@@ -16,6 +16,9 @@ add_executable(egrpc_unit_tests
   test_call_state.cc
   test_call_headers.cc
   test_shim_stubs.cc
+  test_shim_args.cc
+  test_backoff.cc
+  test_dns_resolver.cc
 )
 
 target_include_directories(egrpc_unit_tests SYSTEM PRIVATE

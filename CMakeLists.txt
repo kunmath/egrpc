@@ -46,6 +46,7 @@ endif()
 # ---------------------------------------------------------------------------
 set(EGRPC_SOURCES
   src/transport/tls_socket.cc
+  src/transport/dns_resolver.cc
   src/transport/http2_session.cc
   src/transport/timer_heap.cc
   src/transport/wakeup.cc

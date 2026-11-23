@@ -58,6 +58,61 @@ In "normal" mode, specific test paths also trigger targeted wire behaviors:
   - "/test.Stream/TrailersOnlyDenied": immediately on RequestReceived (before
     request DATA) send trailers-only HEADERS with grpc-status: 7,
     grpc-message: denied, end_stream=True.
+
+M6 multi-connection modes (resilience: reconnect, keepalive, GOAWAY, shutdown).
+Every connection in these modes is served on its own thread, so a stalled or
+blackholed connection N never blocks the accept of connection N+1. Connections
+are numbered from 1 in accept order. "OK service" below means: when a request
+stream ends, reply :status 200 + application/grpc + one gRPC-framed
+routeguide.Feature named "ok-conn-<N>" + trailers grpc-status: 0, and let h2
+auto-ack PINGs.
+  - "multi_conn_ok": OK service on every connection.
+  - "drop_first_then_ok": connection 1 closes the socket as soon as a request
+    arrives (RequestReceived); connections 2+ get OK service.
+  - "blackhole_after_first_rpc": connection 1 answers its first RPC with OK and
+    then never sends another byte (PINGs are never acked). It keeps reading and
+    discarding inbound bytes only to record the client's unanswered PINGs and
+    the client's close. Connections 2+ get OK service.
+  - "goaway_too_many_pings_then_ok": connection 1 gives OK service until the
+    first client PING, then sends GOAWAY(ENHANCE_YOUR_CALM,
+    last_stream_id=<highest request stream>, debug=b"too_many_pings") and
+    discards input until the client closes (or a 2 s grace). Connections 2+ get
+    OK service (PING timestamps recorded per connection).
+  - "goaway_split_drain": connection 1 waits until two request streams have
+    ended, then sends a raw GOAWAY(NO_ERROR, last_stream_id=<first stream>)
+    (no RST_STREAM for the second stream), and drain_delay_ms later completes
+    the first stream with OK. The second stream is never answered. Connections
+    2+ get OK service.
+  - "goaway_stall_drain": connection 1 sends a raw GOAWAY(NO_ERROR,
+    last_stream_id=<first stream>) as soon as the first request arrives and
+    never answers it. Connections 2+ get OK service.
+  - "flap_ready_drop": every connection gets OK service but is closed hold_ms
+    after the server's SETTINGS were sent.
+  - "server_cancel": path ".../GetFeature" -> trailers-only grpc-status: 1
+    (CANCELLED); path "/test.Stream/RstCancel" -> RST_STREAM(CANCEL);
+    ".../ListFeatures" and "/test.Stream/Stall" -> initial headers, then stall.
+  - "shutdown_blackhole": on the first request send initial :status 200
+    headers, then never read or write again (dead peer) until stop().
+  - "shutdown_blackhole_large_window": as "shutdown_blackhole", but the
+    server's initial SETTINGS advertise INITIAL_WINDOW_SIZE = 4 MiB and are
+    followed by a connection-level WINDOW_UPDATE of +4 MiB, so the client
+    holds megabytes of open stream + connection send window when the peer
+    goes dead (pending output is then bounded by socket buffers, not by
+    HTTP/2 flow control).
+  - "stall_after_headers": when a request stream ends (StreamEnded, after the
+    request was recorded in ``requests``), send initial :status 200 +
+    content-type application/grpc HEADERS (no END_STREAM), flush, and leave
+    the stream open forever (no DATA, no trailers). Keeps reading (PINGs are
+    auto-acked). Honors ``max_concurrent_streams``. Unlike the legacy
+    "stall_streams", a client observing initial metadata knows the server
+    has received the whole request.
+
+Per-connection records (``connections`` / ``wait_for_connections``) carry:
+index, accepted, tls_done, settings_sent, remote_settings, closed (monotonic
+seconds), pings (timestamps of client PINGs, incl. unanswered ones in
+blackhole), requests [(stream_id, path)], resets [(stream_id, code)],
+goaways [(last_stream_id, code)] received from the client, goaway_sent.
+Legacy single-connection modes record only index/accepted/tls_done/closed.
 """
 
 import json
@@ -76,6 +131,28 @@ from h2.errors import ErrorCodes
 
 # How long to hold a goaway'd connection open so the client can read the frame.
 _GOAWAY_GRACE_S = 2.0
+
+# M6 modes served thread-per-connection by _serve_multi().
+_MULTI_CONN_MODES = (
+    "multi_conn_ok",
+    "drop_first_then_ok",
+    "blackhole_after_first_rpc",
+    "goaway_too_many_pings_then_ok",
+    "goaway_split_drain",
+    "goaway_stall_drain",
+    "flap_ready_drop",
+    "server_cancel",
+    "shutdown_blackhole",
+    "shutdown_blackhole_large_window",
+    "stall_after_headers",
+)
+
+# "shutdown_blackhole_large_window": advertised stream (SETTINGS) and
+# connection (WINDOW_UPDATE increment) flow-control window.
+_LARGE_WINDOW_BYTES = 4 * 1024 * 1024
+
+_H2_FRAME_GOAWAY = 0x7
+_H2_FRAME_PING = 0x6
 
 
 def _encode_varint(n):
@@ -189,8 +266,11 @@ class H2TestServer:
         initial_window_size=None,
         stream_frames_count=40,
         stream_frame_payload_bytes=1024,
+        port=0,
+        hold_ms=0,
+        drain_delay_ms=150,
     ):
-        if mode not in (
+        if mode not in _MULTI_CONN_MODES and mode not in (
             "normal",
             "blackhole",
             "goaway_too_many_pings",
@@ -213,6 +293,9 @@ class H2TestServer:
         self._initial_window_size = initial_window_size
         self._stream_frames_count = stream_frames_count
         self._stream_frame_payload_bytes = stream_frame_payload_bytes
+        self._bind_port = int(port)
+        self._hold_s = hold_ms / 1000.0
+        self._drain_delay_s = drain_delay_ms / 1000.0
         self._listener = None
         self._thread = None
         self._stop = threading.Event()
@@ -221,6 +304,10 @@ class H2TestServer:
         self._reset_cond = threading.Condition(self._lock)
         self._req_cond = threading.Condition(self._lock)
         self._goaway_cond = threading.Condition(self._lock)
+        self._conn_cond = threading.Condition(self._lock)
+        # Per-connection records (see module docstring); guarded by _lock.
+        self._conns = []
+        self._conn_threads = []
 
         # Event timestamps / observations. Guarded by _lock for live reads.
         self._events = {
@@ -278,6 +365,66 @@ class H2TestServer:
         with self._lock:
             return list(self._events["goaways"])
 
+    @staticmethod
+    def _copy_conn(cs):
+        out = dict(cs)
+        for key in ("pings", "requests", "resets", "goaways"):
+            out[key] = list(cs[key])
+        return out
+
+    @property
+    def connections(self):
+        """Snapshot (deep-copied) of the per-connection records."""
+        with self._lock:
+            return [self._copy_conn(cs) for cs in self._conns]
+
+    def wait_for_connections(self, count=1, timeout=5.0):
+        """Wait until at least `count` connections were accepted; snapshot."""
+        deadline = time.monotonic() + timeout
+        with self._conn_cond:
+            while len(self._conns) < count:
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    break
+                self._conn_cond.wait(rem)
+            return [self._copy_conn(cs) for cs in self._conns]
+
+    def wait_for_conn_closed(self, index, timeout=5.0):
+        """Wait until connection `index` (1-based) is closed; snapshot or None."""
+        deadline = time.monotonic() + timeout
+        with self._conn_cond:
+            while True:
+                if len(self._conns) >= index and self._conns[index - 1]["closed"] is not None:
+                    return self._copy_conn(self._conns[index - 1])
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    return None
+                self._conn_cond.wait(rem)
+
+    def _new_conn_record(self):
+        with self._conn_cond:
+            cs = {
+                "index": len(self._conns) + 1,
+                "accepted": time.monotonic(),
+                "tls_done": None,
+                "settings_sent": None,
+                "remote_settings": None,
+                "closed": None,
+                "pings": [],
+                "requests": [],
+                "resets": [],
+                "goaways": [],
+                "goaway_sent": None,
+            }
+            self._conns.append(cs)
+            self._conn_cond.notify_all()
+            return cs
+
+    def _set_conn(self, cs, key, value):
+        with self._conn_cond:
+            cs[key] = value
+            self._conn_cond.notify_all()
+
     def _build_context(self):
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(certfile=self._certfile, keyfile=self._keyfile)
@@ -287,7 +434,7 @@ class H2TestServer:
     def start(self):
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._listener.bind(("127.0.0.1", 0))
+        self._listener.bind(("127.0.0.1", self._bind_port))
         self._listener.listen(8)
         self._listener.settimeout(0.25)
         self.port = self._listener.getsockname()[1]
@@ -308,6 +455,14 @@ class H2TestServer:
             except OSError:
                 # Listener closed during stop().
                 break
+            if self._mode in _MULTI_CONN_MODES:
+                cs = self._new_conn_record()
+                t = threading.Thread(
+                    target=self._handle_multi, args=(ctx, raw, cs), daemon=True
+                )
+                self._conn_threads.append(t)
+                t.start()
+                continue
             try:
                 self._handle(ctx, raw)
             except (ssl.SSLError, OSError):
@@ -316,14 +471,17 @@ class H2TestServer:
 
     def _handle(self, ctx, raw):
         conn = None
+        cs = self._new_conn_record()
         try:
             conn = ctx.wrap_socket(raw, server_side=True)
             self._events["connected"] = time.monotonic()
+            self._set_conn(cs, "tls_done", self._events["connected"])
             self._serve(conn)
         except (ssl.SSLError, OSError):
             pass
         finally:
             self._events["connection_lost"] = time.monotonic()
+            self._set_conn(cs, "closed", self._events["connection_lost"])
             try:
                 if conn is not None:
                     conn.close()
@@ -702,6 +860,338 @@ class H2TestServer:
             if self._mode == "blackhole" and saw_remote_settings:
                 blackholed = True
 
+    # --- M6 multi-connection modes ------------------------------------------
+
+    def _conn_behavior(self, index):
+        mode = self._mode
+        if mode == "multi_conn_ok":
+            return "ok"
+        if mode == "flap_ready_drop":
+            return "flap"
+        if mode == "server_cancel":
+            return "server_cancel"
+        if mode in ("shutdown_blackhole", "shutdown_blackhole_large_window"):
+            return "headers_then_blackhole"
+        if mode == "stall_after_headers":
+            return "headers_on_end_then_stall"
+        if index > 1:
+            return "ok"
+        return {
+            "drop_first_then_ok": "drop_on_request",
+            "blackhole_after_first_rpc": "ok_then_blackhole",
+            "goaway_too_many_pings_then_ok": "goaway_on_ping",
+            "goaway_split_drain": "split_drain",
+            "goaway_stall_drain": "stall_drain",
+        }[mode]
+
+    def _handle_multi(self, ctx, raw, cs):
+        conn = None
+        try:
+            raw.settimeout(5.0)  # bound a stuck TLS handshake
+            conn = ctx.wrap_socket(raw, server_side=True)
+            self._set_conn(cs, "tls_done", time.monotonic())
+            self._serve_multi(conn, cs)
+        except (ssl.SSLError, OSError, h2.exceptions.H2Error):
+            pass
+        finally:
+            self._set_conn(cs, "closed", time.monotonic())
+            try:
+                if conn is not None:
+                    conn.close()
+                else:
+                    raw.close()
+            except OSError:
+                pass
+
+    @staticmethod
+    def _send_ok(h2conn, sid, conn_index):
+        try:
+            h2conn.send_headers(
+                sid, [(":status", "200"), ("content-type", "application/grpc")]
+            )
+            h2conn.send_data(
+                sid, _grpc_frame(_encode_feature("ok-conn-{}".format(conn_index)))
+            )
+            h2conn.send_headers(sid, [("grpc-status", "0")], end_stream=True)
+        except h2.exceptions.H2Error:
+            pass
+
+    def _record_ping(self, cs):
+        t = time.monotonic()
+        with self._lock:
+            cs["pings"].append(t)
+            self._events["pings"].append(t)
+
+    def _serve_multi(self, conn, cs):
+        idx = cs["index"]
+        behavior = self._conn_behavior(idx)
+
+        h2conn = h2.connection.H2Connection(
+            config=h2.config.H2Configuration(client_side=False)
+        )
+        h2conn.initiate_connection()
+        settings_to_update = {}
+        if self._max_concurrent_streams is not None:
+            settings_to_update[h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS] = int(
+                self._max_concurrent_streams
+            )
+        large_window = self._mode == "shutdown_blackhole_large_window"
+        if self._initial_window_size is not None:
+            settings_to_update[h2.settings.SettingCodes.INITIAL_WINDOW_SIZE] = int(
+                self._initial_window_size
+            )
+        elif large_window:
+            settings_to_update[h2.settings.SettingCodes.INITIAL_WINDOW_SIZE] = (
+                _LARGE_WINDOW_BYTES
+            )
+        if settings_to_update:
+            h2conn.update_settings(settings_to_update)
+        if large_window:
+            # Connection-level WINDOW_UPDATE (stream 0), sent with the initial
+            # SETTINGS -- i.e. well before the first stream's headers and the
+            # blackhole -- so the client's connection send window is ~4 MiB.
+            h2conn.increment_flow_control_window(_LARGE_WINDOW_BYTES)
+        conn.sendall(h2conn.data_to_send())
+        settings_sent = time.monotonic()
+        self._set_conn(cs, "settings_sent", settings_sent)
+
+        def flush():
+            out = h2conn.data_to_send()
+            if out:
+                conn.sendall(out)
+
+        def send_raw_goaway(last_stream_id, error_code, debug=b""):
+            flush()  # keep h2's queued frames ahead of the raw frame
+            payload = struct.pack("!II", last_stream_id & 0x7FFFFFFF, error_code) + debug
+            conn.sendall(_raw_h2_frame(_H2_FRAME_GOAWAY, 0, 0, payload))
+            self._set_conn(cs, "goaway_sent", time.monotonic())
+
+        close_at = settings_sent + self._hold_s if behavior == "flap" else None
+        # phase: "h2" (normal framing), "silent_read" (never write; parse raw
+        # frames only to record PINGs), "discard" (read and drop until EOF or
+        # discard_deadline), "dead" (no reads, no writes).
+        phase = "h2"
+        discard_deadline = None
+        timers = []  # [(due_monotonic, fn)]
+        stream_paths = {}
+        request_sids = []
+        ended_order = []
+        answered = 0
+        goaway_sent = False
+        raw_buf = bytearray()
+
+        while not self._stop.is_set():
+            now = time.monotonic()
+            if close_at is not None and now >= close_at:
+                return
+            if phase == "dead":
+                self._stop.wait(0.1)
+                continue
+            if phase == "discard" and now >= discard_deadline:
+                return
+
+            if timers:
+                due = [t for t in timers if t[0] <= now]
+                if due:
+                    timers = [t for t in timers if t[0] > now]
+                    for _, fn in due:
+                        fn()
+                    flush()
+
+            wake = [0.05]
+            if close_at is not None:
+                wake.append(close_at - now)
+            if timers:
+                wake.append(min(t[0] for t in timers) - now)
+            conn.settimeout(max(0.005, min(wake)))
+            try:
+                data = conn.recv(65535)
+            except socket.timeout:
+                continue
+            except (ssl.SSLError, OSError):
+                return
+            if not data:
+                return
+
+            if phase == "discard":
+                continue
+            if phase == "silent_read":
+                raw_buf.extend(data)
+                while len(raw_buf) >= 9:
+                    length = int.from_bytes(raw_buf[0:3], "big")
+                    if len(raw_buf) < 9 + length:
+                        break
+                    if raw_buf[3] == _H2_FRAME_PING and not (raw_buf[4] & 0x1):
+                        self._record_ping(cs)
+                    del raw_buf[: 9 + length]
+                continue
+
+            try:
+                events = h2conn.receive_data(data)
+            except h2.exceptions.ProtocolError:
+                try:
+                    flush()
+                except (ssl.SSLError, OSError):
+                    pass
+                return
+
+            new_streams = []
+            ended_streams = []
+            saw_ping = False
+            client_goaway = False
+            for event in events:
+                if isinstance(event, h2.events.RemoteSettingsChanged):
+                    if cs["remote_settings"] is None:
+                        self._set_conn(cs, "remote_settings", time.monotonic())
+                elif isinstance(event, h2.events.PingReceived):
+                    self._record_ping(cs)
+                    saw_ping = True
+                elif isinstance(event, h2.events.RequestReceived):
+                    req_path = ""
+                    for k, v in event.headers:
+                        k_str = k.decode("ascii") if isinstance(k, bytes) else k
+                        if k_str == ":path":
+                            req_path = v.decode("ascii") if isinstance(v, bytes) else v
+                            break
+                    stream_paths[event.stream_id] = req_path
+                    request_sids.append(event.stream_id)
+                    with self._req_cond:
+                        cs["requests"].append((event.stream_id, req_path))
+                        self._events["requests"].append(event.stream_id)
+                        self._req_cond.notify_all()
+                    new_streams.append(event.stream_id)
+                elif isinstance(event, h2.events.StreamEnded):
+                    ended_streams.append(event.stream_id)
+                elif isinstance(event, h2.events.StreamReset):
+                    with self._reset_cond:
+                        entry = (event.stream_id, int(event.error_code))
+                        cs["resets"].append(entry)
+                        self._events["resets"].append(entry)
+                        self._reset_cond.notify_all()
+                elif isinstance(event, h2.events.ConnectionTerminated):
+                    with self._goaway_cond:
+                        entry = (event.last_stream_id, int(event.error_code))
+                        cs["goaways"].append(entry)
+                        self._events["goaways"].append(entry)
+                        self._goaway_cond.notify_all()
+                    client_goaway = True
+
+            if behavior == "drop_on_request" and new_streams:
+                return
+
+            if behavior in ("ok", "flap"):
+                for sid in ended_streams:
+                    self._send_ok(h2conn, sid, idx)
+
+            elif behavior == "ok_then_blackhole":
+                for sid in ended_streams:
+                    if answered == 0:
+                        self._send_ok(h2conn, sid, idx)
+                        answered += 1
+
+            elif behavior == "goaway_on_ping":
+                if not goaway_sent:
+                    for sid in ended_streams:
+                        self._send_ok(h2conn, sid, idx)
+                    if saw_ping:
+                        h2conn.close_connection(
+                            error_code=ErrorCodes.ENHANCE_YOUR_CALM,
+                            additional_data=b"too_many_pings",
+                            last_stream_id=max(request_sids) if request_sids else 0,
+                        )
+                        flush()
+                        self._set_conn(cs, "goaway_sent", time.monotonic())
+                        goaway_sent = True
+                        phase = "discard"
+                        discard_deadline = time.monotonic() + _GOAWAY_GRACE_S
+                        continue
+
+            elif behavior == "split_drain":
+                if not goaway_sent:
+                    ended_order.extend(ended_streams)
+                    if len(ended_order) >= 2:
+                        first = min(ended_order)
+                        send_raw_goaway(first, 0)
+                        goaway_sent = True
+                        timers.append(
+                            (
+                                time.monotonic() + self._drain_delay_s,
+                                lambda sid=first: self._send_ok(h2conn, sid, idx),
+                            )
+                        )
+
+            elif behavior == "stall_drain":
+                if not goaway_sent and ended_streams:
+                    send_raw_goaway(min(ended_streams), 0)
+                    goaway_sent = True
+
+            elif behavior == "server_cancel":
+                for sid in new_streams:
+                    path = stream_paths.get(sid, "")
+                    if path.endswith("/ListFeatures") or path.endswith("/Stall"):
+                        try:
+                            h2conn.send_headers(
+                                sid,
+                                [(":status", "200"), ("content-type", "application/grpc")],
+                            )
+                        except h2.exceptions.H2Error:
+                            pass
+                for sid in ended_streams:
+                    path = stream_paths.get(sid, "")
+                    try:
+                        if path.endswith("/RstCancel"):
+                            h2conn.reset_stream(sid, error_code=ErrorCodes.CANCEL)
+                        elif path.endswith("/GetFeature"):
+                            h2conn.send_headers(
+                                sid,
+                                [
+                                    (":status", "200"),
+                                    ("content-type", "application/grpc"),
+                                    ("grpc-status", "1"),
+                                    ("grpc-message", "server-cancelled"),
+                                ],
+                                end_stream=True,
+                            )
+                    except h2.exceptions.H2Error:
+                        pass
+
+            elif behavior == "headers_on_end_then_stall":
+                # The request is fully received (and already recorded above):
+                # answer with initial headers only and hold the stream open.
+                for sid in ended_streams:
+                    try:
+                        h2conn.send_headers(
+                            sid,
+                            [(":status", "200"), ("content-type", "application/grpc")],
+                            end_stream=False,
+                        )
+                    except h2.exceptions.H2Error:
+                        pass
+
+            elif behavior == "headers_then_blackhole":
+                for sid in new_streams:
+                    try:
+                        h2conn.send_headers(
+                            sid,
+                            [(":status", "200"), ("content-type", "application/grpc")],
+                        )
+                    except h2.exceptions.H2Error:
+                        pass
+
+            try:
+                flush()
+            except h2.exceptions.H2Error:
+                return
+
+            if client_goaway:
+                # Client is closing (e.g. graceful Shutdown): just drain input.
+                phase = "discard"
+                discard_deadline = time.monotonic() + _GOAWAY_GRACE_S
+            elif behavior == "ok_then_blackhole" and answered > 0:
+                phase = "silent_read"
+            elif behavior == "headers_then_blackhole" and new_streams:
+                phase = "dead"
+
     def stop(self):
         self._stop.set()
         if self._listener is not None:
@@ -715,6 +1205,8 @@ class H2TestServer:
                 # Serve thread wedged: reading events now would race the
                 # writer. Skip the report; the test will fail loudly on it.
                 return
+        for t in self._conn_threads:
+            t.join(timeout=5.0)
         self._write_report()
 
     def _write_report(self):

@@ -30,3 +30,17 @@ target_link_libraries(egrpc_unary_call PRIVATE egrpc_static route_guide_proto eg
 add_executable(egrpc_stream_probe stream_probe_main.cc)
 target_include_directories(egrpc_stream_probe PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(egrpc_stream_probe PRIVATE egrpc_static route_guide_proto egrpc_warnings)
+
+# M6 probe: reconnect/backoff, wait-for-ready, keepalive enforcement, GOAWAY
+# drain & replace, bounded shutdown, and failure origin, driven by
+# tests/test_reconnect.py, tests/test_shutdown.py and tests/test_keepalive.py.
+# Uses both the internal ChannelImpl and the public shim via the unmodified
+# generated route_guide stubs (exempt from -Werror like the example client).
+add_executable(egrpc_resilience_probe
+  resilience_probe_main.cc
+  ${PROJECT_SOURCE_DIR}/examples/route_guide/gen/route_guide.grpc.pb.cc)
+set_source_files_properties(
+  ${PROJECT_SOURCE_DIR}/examples/route_guide/gen/route_guide.grpc.pb.cc
+  PROPERTIES COMPILE_OPTIONS "-w")
+target_include_directories(egrpc_resilience_probe PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(egrpc_resilience_probe PRIVATE egrpc_static route_guide_proto egrpc_warnings)

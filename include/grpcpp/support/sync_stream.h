@@ -234,7 +234,10 @@ class ClientReaderFactory {
                                  grpc::ClientContext* context, const W& request) {
     std::string request_bytes;
     Status s = SerializationTraits<W>::Serialize(request, &request_bytes);
-    if (!s.ok()) return new ClientReader<R>(std::move(s));
+    if (!s.ok()) {
+      ClientContextAccess::MarkStatusLocal(context);
+      return new ClientReader<R>(std::move(s));
+    }
     return new ClientReader<R>(StartServerStreamRaw(channel, method, context, request_bytes));
   }
 };

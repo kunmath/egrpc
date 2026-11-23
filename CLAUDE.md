@@ -74,7 +74,7 @@ per egrpc release**, verified in CI by regenerating stubs and compiling.
 - Pre-M5 gate (§8a): scarthgap bitbake spike validating the protobuf matrix —
   scarthgap is the sole supported Yocto LTS for v0.1 (decided)
 - **M5 — Server-streaming + deadlines + cancellation: done**
-- M6 — Resilience: reconnect, keepalive enforcement, shutdown: not started
+- **M6 — Resilience: reconnect, keepalive enforcement, shutdown: done**
 - M7 — resilient_stream + native config API: not started
 - M8 — Interop subset, Yocto layer, docs: not started
 

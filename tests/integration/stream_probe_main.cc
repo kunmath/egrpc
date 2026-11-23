@@ -239,6 +239,8 @@ int RunNoSettings(const std::string& host, uint16_t port, const std::string& ca_
 
   egrpc::internal::ChannelOptions opts;
   opts.connect_timeout = std::chrono::milliseconds(300);
+  // Attempt timeout is max(connect_timeout, initial backoff) (§5.3).
+  opts.initial_reconnect_backoff = std::chrono::milliseconds(300);
 
   egrpc::internal::ChannelImpl channel(host, port, std::move(tls), opts);
 

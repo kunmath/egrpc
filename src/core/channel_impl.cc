@@ -1,12 +1,14 @@
-// egrpc — channel over one EventThread-owned transport (design §4.4, §5.4,
-// §5.6, §5.7). Reconnect/backoff lands in M6; transport failure is terminal
-// until then.
+// egrpc — channel over one EventThread-owned transport (design §4.1, §4.2,
+// §4.4, §5.2–§5.7): connectivity FSM with backoff reconnect, non-blocking
+// DNS, wait-for-ready admission, keepalive enforcement, GOAWAY drain &
+// replace, and bounded clean shutdown.
 #include "core/channel_impl.h"
 
 #include <poll.h>
 
 #include <algorithm>
 #include <climits>
+#include <cstdio>
 #include <utility>
 
 namespace egrpc {
@@ -14,9 +16,15 @@ namespace internal {
 
 namespace {
 
+using std::chrono::milliseconds;
 using std::chrono::steady_clock;
 
 constexpr size_t kMaxHttp2Window = static_cast<size_t>(INT32_MAX);
+
+// Upper bound for ENHANCE_YOUR_CALM keepalive_time doubling (§5.2).
+constexpr milliseconds kMaxKeepaliveTime{24LL * 60 * 60 * 1000};
+
+constexpr char kShutDownMessage[] = "channel is shut down";
 
 // Clamps max_receive_message_size so that max_receive_message_size + 5 always
 // fits within RFC 7540's INT32_MAX window limit (preserving the §5.4 invariant
@@ -34,6 +42,33 @@ uint32_t ComputeStreamWindow(size_t effective_max_receive_message_size, size_t s
   return static_cast<uint32_t>(base + slack);
 }
 
+BackoffOptions MakeBackoffOptions(const ChannelOptions& o) {
+  BackoffOptions b;
+  b.initial_backoff = o.initial_reconnect_backoff;
+  b.multiplier = o.reconnect_backoff_multiplier;
+  b.max_backoff = o.max_reconnect_backoff;
+  b.jitter = o.reconnect_backoff_jitter;
+  b.connect_timeout = o.connect_timeout;
+  b.ready_stability_threshold = o.ready_stability_threshold;
+  return b;
+}
+
+// Doubles keepalive_time, clamped to kMaxKeepaliveTime without overflow. A
+// value already above the cap is left unchanged (never shortened).
+milliseconds DoubleKeepaliveTime(milliseconds t) {
+  if (t.count() <= 0 || t >= kMaxKeepaliveTime) return t;
+  if (t >= kMaxKeepaliveTime / 2) return kMaxKeepaliveTime;
+  return t * 2;
+}
+
+// Remaining whole milliseconds until `deadline` (0 if already passed).
+int RemainingMs(steady_clock::time_point deadline) {
+  const auto now = steady_clock::now();
+  if (deadline <= now) return 0;
+  const auto ms = std::chrono::duration_cast<milliseconds>(deadline - now).count();
+  return static_cast<int>(std::min<int64_t>(ms, INT_MAX));
+}
+
 void UpdateMax(std::atomic<size_t>& high_water, size_t value) {
   if (value > high_water.load(std::memory_order_relaxed)) {
     high_water.store(value, std::memory_order_relaxed);
@@ -45,6 +80,7 @@ void CloseCompletionLocal(const std::shared_ptr<CallCompletion>& completion, Sta
   CallCompletion::Result r;
   r.code = code;
   r.message = std::move(message);
+  r.origin = StatusOrigin::kLocal;
   completion->Close(std::move(r), /*discard_queued=*/true);
 }
 
@@ -58,23 +94,28 @@ ChannelImpl::ChannelImpl(std::string host, uint16_t port, TlsConfig tls, Channel
       authority_((host_.find(':') == std::string::npos ? host_ : "[" + host_ + "]") + ":" +
                  std::to_string(port)),
       tls_(std::move(tls)),
-      options_(options),
+      options_(std::move(options)),
       effective_max_receive_message_size_(
           ClampMaxReceiveMessageSize(options_.max_receive_message_size)),
       stream_window_(
           ComputeStreamWindow(effective_max_receive_message_size_, options_.stream_window_slack)),
       effective_max_queued_bytes_(options_.max_queued_bytes == 0 ? stream_window_
-                                                                 : options_.max_queued_bytes) {
+                                                                 : options_.max_queued_bytes),
+      backoff_(MakeBackoffOptions(options_)),
+      resolver_(options_.resolve_fn),
+      effective_keepalive_time_(options_.http2.keepalive_time) {
+  effective_keepalive_time_ms_.store(effective_keepalive_time_.count(), std::memory_order_relaxed);
   loop_.SetWakeupCallback([this] { DrainCancelQueue(); });
   loop_.SetFatalExitCallback([this] {
     ClearCancelQueue();
-    TearDown("event loop poll() error", /*finalize_draining=*/true);
+    FatalLoopExit("event loop poll() error");
   });
   loop_ok_ = loop_.Start();
   if (!loop_ok_) {
-    state_ = State::kFailed;  // no thread running: safe to write from here
-    failure_detail_ = "failed to start channel event thread";
-    terminal_error_ = failure_detail_;
+    // No thread running: safe to write EventThread-owned state from here.
+    SetState(ConnectivityState::kShutdown);
+    last_failure_detail_ = "failed to start channel event thread";
+    terminal_error_ = last_failure_detail_;
   }
 }
 
@@ -84,7 +125,7 @@ ChannelImpl::CallHandle ChannelImpl::StartCall(
     CallMode mode, const std::string& method_path, std::string request,
     Http2Session::HeaderList metadata,
     std::optional<std::chrono::steady_clock::time_point> deadline, uint64_t preallocated_id,
-    std::shared_ptr<CallCompletion> prebound_completion) {
+    std::shared_ptr<CallCompletion> prebound_completion, bool wait_for_ready) {
   const uint64_t call_id = preallocated_id != 0 ? preallocated_id : AllocateCallId();
   std::shared_ptr<CallCompletion> completion = prebound_completion
                                                    ? std::move(prebound_completion)
@@ -109,6 +150,23 @@ ChannelImpl::CallHandle ChannelImpl::StartCall(
     return {call_id, std::move(completion)};
   }
 
+  auto fail_unavailable = [&] {
+    std::string detail;
+    {
+      std::lock_guard<std::mutex> lock(terminal_error_mu_);
+      detail = terminal_error_;
+    }
+    CloseCompletionLocal(completion, StatusCode::kUnavailable,
+                         detail.empty() ? kShutDownMessage : std::move(detail));
+  };
+
+  // §5.7: once Shutdown() has begun, refuse without posting (and so without
+  // ever starting a connect or DNS resolve).
+  if (!loop_ok_ || shutting_down_.load(std::memory_order_acquire)) {
+    fail_unavailable();
+    return {call_id, std::move(completion)};
+  }
+
   // shared_ptr wrapper: std::function requires copyable callables, and the
   // body is worth not copying.
   auto pc = std::make_shared<PendingCall>();
@@ -120,24 +178,18 @@ ChannelImpl::CallHandle ChannelImpl::StartCall(
   pc->framed_body += request;
   pc->metadata = std::move(metadata);
   pc->deadline = deadline;
+  pc->wait_for_ready = wait_for_ready;
 
-  if (!loop_ok_ || !loop_.Post([this, pc] { HandleNewCall(std::move(*pc)); })) {
-    std::string detail;
-    {
-      std::lock_guard<std::mutex> lock(terminal_error_mu_);
-      detail = terminal_error_;
-    }
-    CloseCompletionLocal(completion, StatusCode::kUnavailable,
-                         detail.empty() ? "channel is shut down" : std::move(detail));
-  }
+  if (!loop_.Post([this, pc] { HandleNewCall(std::move(*pc)); })) fail_unavailable();
   return {call_id, std::move(completion)};
 }
 
 CallCompletion::Result ChannelImpl::UnaryCall(
     const std::string& method_path, std::string request, Http2Session::HeaderList metadata,
-    std::optional<std::chrono::steady_clock::time_point> deadline) {
-  CallHandle handle =
-      StartCall(CallMode::kUnary, method_path, std::move(request), std::move(metadata), deadline);
+    std::optional<std::chrono::steady_clock::time_point> deadline, bool wait_for_ready) {
+  CallHandle handle = StartCall(CallMode::kUnary, method_path, std::move(request),
+                                std::move(metadata), deadline, /*preallocated_id=*/0,
+                                /*prebound_completion=*/nullptr, wait_for_ready);
   return handle.completion->Wait();
 }
 
@@ -201,70 +253,88 @@ void ChannelImpl::Shutdown() {
   if (shutdown_done_) return;
   shutdown_done_ = true;
 
+  // The total budget starts now, not when DoShutdown() finally runs.
+  const auto deadline = steady_clock::now() + std::max(options_.shutdown_timeout, milliseconds(0));
+  shutdown_deadline_ns_.store(static_cast<int64_t>(deadline.time_since_epoch().count()),
+                              std::memory_order_release);
+
+  // Close the admission gate first: StartCall and any HandleNewCall still
+  // queued ahead of DoShutdown() reject without starting a connect.
+  shutting_down_.store(true, std::memory_order_release);
+
   if (!loop_ok_) return;  // loop never ran; nothing to drain or join
 
   // Atomically closes the EventThread Post() gate and appends DoShutdown() as
   // the last op before thread exit, preventing any call from slipping in after
   // DoShutdown() and avoiding deadlock if poll() exited early.
   loop_.Stop([this] { DoShutdown(); });
+  // The EventThread has joined; drop any cancellation queued after its final
+  // drain (also covers a fatal poll() exit that skipped DoShutdown()).
+  ClearCancelQueue();
 }
 
 // --- Event-thread only -------------------------------------------------------
 
+void ChannelImpl::SetState(ConnectivityState state) {
+  state_ = state;
+  state_snapshot_.store(state, std::memory_order_release);
+}
+
 void ChannelImpl::HandleNewCall(PendingCall pc) {
-  if (state_ == State::kShutdown) {
-    CloseCompletionLocal(pc.completion, StatusCode::kUnavailable, "channel is shut down");
+  if (shutting_down_.load(std::memory_order_acquire) || state_ == ConnectivityState::kShutdown) {
+    CloseCompletionLocal(pc.completion, StatusCode::kUnavailable, kShutDownMessage);
     return;
   }
   if (pc.completion->cancel_requested()) {
     CloseCompletionLocal(pc.completion, StatusCode::kCancelled, "Cancelled");
     return;
   }
-  if (pc.deadline.has_value() && *pc.deadline <= steady_clock::now()) {
+  const auto now = steady_clock::now();
+  if (pc.deadline.has_value() && *pc.deadline <= now) {
     CloseCompletionLocal(pc.completion, StatusCode::kDeadlineExceeded, "Deadline Exceeded");
     return;
   }
-  if (state_ == State::kFailed) {
-    CloseCompletionLocal(pc.completion, StatusCode::kUnavailable, failure_detail_);
-    return;
+  // §4.4 admission table: fail-fast calls fail immediately in
+  // TRANSIENT_FAILURE and while the READY connection is draining after
+  // GOAWAY; wait-for-ready calls queue for the next connection.
+  if (!pc.wait_for_ready) {
+    if (state_ == ConnectivityState::kTransientFailure) {
+      CloseCompletionLocal(pc.completion, StatusCode::kUnavailable, last_failure_detail_);
+      return;
+    }
+    if (state_ == ConnectivityState::kReady && goaway_received_) {
+      CloseCompletionLocal(pc.completion, StatusCode::kUnavailable, goaway_detail_);
+      return;
+    }
   }
 
   // Local deadline timer (§5.6): armed at admission so even calls queued in
-  // pending_calls_ (connecting or at concurrent-stream cap) fail on time.
+  // pending_calls_ (connecting, backoff, or at the concurrent-stream cap)
+  // fail on time.
   if (pc.deadline.has_value()) {
-    const auto now = steady_clock::now();
-    if (*pc.deadline <= now) {
-      CloseCompletionLocal(pc.completion, StatusCode::kDeadlineExceeded, "Deadline Exceeded");
-      return;
-    }
     const uint64_t cid = pc.call_id;
     pc.deadline_timer = loop_.AddTimer(*pc.deadline - now, [this, cid] { OnCallDeadline(cid); });
   }
 
   switch (state_) {
-    case State::kIdle:
+    case ConnectivityState::kIdle:
       pending_calls_.push_back(std::move(pc));
       StartConnecting();
       return;
-    case State::kConnecting:
+    case ConnectivityState::kConnecting:
+    case ConnectivityState::kTransientFailure:
       pending_calls_.push_back(std::move(pc));
       return;
-    case State::kReady:
-      if (h2_ != nullptr && h2_->draining()) {
-        if (pc.deadline_timer != 0) loop_.CancelTimer(pc.deadline_timer);
-        CloseCompletionLocal(pc.completion, StatusCode::kUnavailable,
-                             "server sent GOAWAY; no new streams");
-        return;
-      }
-      if (active_calls_.size() >= MaxConcurrentCalls()) {
-        pending_calls_.push_back(std::move(pc));  // resumes in PumpPendingCalls
-        return;
-      }
-      SubmitCall(std::move(pc));
-      FlushOutput();
+    case ConnectivityState::kReady:
+      // FIFO behind any already-queued calls; submits immediately when below
+      // the concurrent-stream cap and not draining after GOAWAY.
+      pending_calls_.push_back(std::move(pc));
+      PumpPendingCalls();
+      if (HasLiveSession()) FlushOutput();
+      RearmKeepalive();
       return;
-    case State::kFailed:
-    case State::kShutdown:
+    case ConnectivityState::kShutdown:
+      FailPendingCall(pc, StatusCode::kUnavailable, kShutDownMessage);
       return;
   }
 }
@@ -302,15 +372,18 @@ void ChannelImpl::TerminateCallById(uint64_t call_id, StatusCode code, const cha
     const int32_t sid = call->stream_id();
     // Queue and flush RST_STREAM before waking the caller in FailLocal() so
     // the reset is already dispatched by the time Finish()/UnaryCall() returns.
-    if (state_ == State::kReady && h2_ != nullptr && sid > 0) {
+    if (HasLiveSession() && sid > 0) {
       h2_->ResetStream(sid, Http2Session::kHttp2Cancel);
       FlushOutput();
     }
     call->FailLocal(code, message);
-    if (state_ == State::kReady) {
+    // A freed slot admits queued calls; a GOAWAY-draining session whose last
+    // stream just ended is replaced.
+    if (HasLiveSession()) {
       PumpPendingCalls();
-      FlushOutput();
+      if (HasLiveSession()) FlushOutput();
     }
+    RearmKeepalive();
     return;
   }
 
@@ -333,7 +406,7 @@ void ChannelImpl::HandleReadConsumed(uint64_t call_id, size_t wire_bytes) {
   if (active_it != active_calls_.end()) {
     CallState* call = active_it->second.get();
     call->DrainScannerToQueue();
-    if (state_ == State::kReady && h2_ != nullptr && call->stream_id() > 0 && wire_bytes > 0) {
+    if (HasLiveSession() && call->stream_id() > 0 && wire_bytes > 0) {
       h2_->ConsumeStream(call->stream_id(), wire_bytes);
       FlushOutput();
     }
@@ -361,87 +434,191 @@ size_t ChannelImpl::MaxConcurrentCalls() const {
 }
 
 void ChannelImpl::PumpPendingCalls() {
-  if (h2_ != nullptr && h2_->draining()) return;
-  while (state_ == State::kReady && !pending_calls_.empty() &&
+  if (state_ != ConnectivityState::kReady || h2_ == nullptr) return;
+  if (goaway_received_) {
+    // §4.2: never open streams on a draining connection. Once its last
+    // stream has finished, replace it (queued wait-for-ready calls go to the
+    // replacement connection).
+    if (active_calls_.empty()) EnterTransientFailure(goaway_detail_);
+    return;
+  }
+  bool submitted = false;
+  while (state_ == ConnectivityState::kReady && h2_ != nullptr && !pending_calls_.empty() &&
          active_calls_.size() < MaxConcurrentCalls()) {
     PendingCall pc = std::move(pending_calls_.front());
     pending_calls_.pop_front();
     SubmitCall(std::move(pc));
+    submitted = true;
   }
+  // 0 → 1 active streams re-enables keepalive when permit_without_calls=false.
+  if (submitted) RearmKeepalive();
 }
 
 void ChannelImpl::SchedulePumpPendingCalls() {
-  if (pump_scheduled_ || state_ != State::kReady) return;
+  if (pump_scheduled_ || !HasLiveSession()) return;
   pump_scheduled_ = true;
   loop_.ScheduleNextTurn([this] {
     if (!pump_scheduled_) return;
     pump_scheduled_ = false;
-    if (state_ == State::kReady) {
-      PumpPendingCalls();
-      if (state_ == State::kReady) FlushOutput();
-    }
+    if (!HasLiveSession()) return;
+    PumpPendingCalls();
+    if (HasLiveSession()) FlushOutput();
+    RearmKeepalive();
   });
 }
 
 void ChannelImpl::StartConnecting() {
-  state_ = State::kConnecting;
-  connect_timer_ = loop_.AddTimer(options_.connect_timeout, [this] {
+  if (state_ == ConnectivityState::kShutdown || shutting_down_.load(std::memory_order_acquire)) {
+    return;
+  }
+  for (TimerId* t : {&reconnect_timer_, &connect_timer_}) {
+    if (*t != 0) {
+      loop_.CancelTimer(*t);
+      *t = 0;
+    }
+  }
+  SetState(ConnectivityState::kConnecting);
+  connect_attempts_.fetch_add(1, std::memory_order_relaxed);
+
+  loop_.UnwatchFd();
+  h2_.reset();
+  sock_.reset();
+  goaway_received_ = false;
+  pending_goaway_process_ = false;
+  goaway_too_many_pings_applied_ = false;
+  goaway_last_stream_id_ = std::numeric_limits<int32_t>::max();
+  read_yield_pending_ = false;
+  write_yield_pending_ = false;
+  pump_scheduled_ = false;
+  tls_read_wants_write_ = false;
+  tls_write_pending_ = false;
+  tls_write_wants_read_ = false;
+
+  // §5.3: every attempt gets max(connect_timeout, current_backoff). Covers
+  // DNS, TCP, TLS, and the peer's initial SETTINGS.
+  const milliseconds attempt_timeout = backoff_.CurrentConnectTimeout();
+  connect_timer_ = loop_.AddTimer(attempt_timeout, [this] {
     connect_timer_ = 0;
-    TearDown(h2_ != nullptr ? "timed out waiting for peer HTTP/2 SETTINGS" : "connect timeout");
+    if (state_ != ConnectivityState::kConnecting) return;
+    if (resolving_dns_) {
+      resolver_.Invalidate();
+      resolving_dns_ = false;
+      EnterTransientFailure("DNS resolution timeout");
+    } else if (h2_ != nullptr) {
+      EnterTransientFailure("timed out waiting for peer HTTP/2 SETTINGS");
+    } else {
+      EnterTransientFailure("connect timeout");
+    }
   });
-  if (!sock_.StartConnect(host_, port_, tls_)) {
-    TearDown(sock_.error());
+
+  // §4.1: re-resolve on every attempt, off the EventThread. on_ready runs on
+  // the resolver thread; DoShutdown()/FatalLoopExit() shut the resolver down
+  // (clearing on_ready under its slot mutex) before this EventThread exits,
+  // and a Post() refused during shutdown is benign. On an immediate resolver
+  // failure (worker cap / thread creation) on_ready runs synchronously here;
+  // Post() from the EventThread is safe (no EventThread lock is held while
+  // ops/timers run) and defers OnDnsResolved() to the next turn.
+  resolving_dns_ = true;
+  dns_gen_ = ++next_dns_gen_;
+  resolver_.Resolve(host_, port_, dns_gen_,
+                    [this](uint64_t gen) { loop_.Post([this, gen] { OnDnsResolved(gen); }); });
+}
+
+void ChannelImpl::OnDnsResolved(uint64_t generation) {
+  (void)generation;  // the slot's own generation tag is authoritative
+  if (state_ != ConnectivityState::kConnecting || !resolving_dns_) return;
+  std::optional<ResolveResult> res = resolver_.TakeResult();
+  // Absent or superseded result (e.g. a duplicate or late wakeup): keep
+  // waiting for the current generation's own wakeup.
+  if (!res.has_value() || res->generation != dns_gen_) return;
+  resolving_dns_ = false;
+  if (!res->ok()) {
+    EnterTransientFailure(res->error.empty() ? "DNS resolution failed" : res->error);
+    return;
+  }
+  sock_ = std::make_unique<TlsSocket>();
+  if (!sock_->StartConnect(host_, res->addresses, tls_)) {
+    EnterTransientFailure(sock_->error().empty() ? "connect failed" : sock_->error());
     return;
   }
   loop_.WatchFd(
-      sock_.fd(), [this] { return sock_.DesiredPollEvents(); },
+      sock_->fd(), [this] { return sock_ != nullptr ? sock_->DesiredPollEvents() : short{0}; },
       [this](short) { OnConnectProgress(); });
 }
 
 void ChannelImpl::OnConnectProgress() {
-  const TlsSocket::IoStatus st = sock_.ContinueConnect();
-  if (st == TlsSocket::IoStatus::kWantRead || st == TlsSocket::IoStatus::kWantWrite) return;
-  if (st == TlsSocket::IoStatus::kOk) {
-    // Keep connect_timer_ armed until the server's initial HTTP/2 SETTINGS
-    // frame arrives (cancelled in hooks.on_remote_settings) so a peer that
-    // completes TLS/ALPN but never speaks HTTP/2 still times out.
-    StartSession();
-  } else {
-    if (connect_timer_ != 0) {
-      loop_.CancelTimer(connect_timer_);
-      connect_timer_ = 0;
+  if (state_ != ConnectivityState::kConnecting || sock_ == nullptr || h2_ != nullptr) return;
+  const int prev_fd = sock_->fd();
+  const TlsSocket::IoStatus st = sock_->ContinueConnect();
+  if (st == TlsSocket::IoStatus::kWantRead || st == TlsSocket::IoStatus::kWantWrite) {
+    // Address fallback: a failed TCP connect to one resolved address opens a
+    // new socket for the next one — watch the new fd.
+    if (sock_->fd() != prev_fd && sock_->fd() >= 0) {
+      loop_.WatchFd(
+          sock_->fd(), [this] { return sock_ != nullptr ? sock_->DesiredPollEvents() : short{0}; },
+          [this](short) { OnConnectProgress(); });
     }
-    TearDown(sock_.error());
+    return;
   }
+  if (st == TlsSocket::IoStatus::kOk) {
+    // Keep connect_timer_ armed (and state CONNECTING) until the server's
+    // initial HTTP/2 SETTINGS arrives, so a peer that completes TLS/ALPN but
+    // never speaks HTTP/2 still times out.
+    StartSession();
+    return;
+  }
+  EnterTransientFailure(sock_->error().empty() ? "connect failed" : sock_->error());
 }
 
 void ChannelImpl::StartSession() {
   Http2Session::Hooks hooks;
+  // Runs inside an nghttp2 callback: only record state and defer work.
   hooks.on_remote_settings = [this] {
     if (connect_timer_ != 0) {
       loop_.CancelTimer(connect_timer_);
       connect_timer_ = 0;
     }
+    if (state_ == ConnectivityState::kConnecting) {
+      SetState(ConnectivityState::kReady);
+      backoff_.OnReady(steady_clock::now());
+    }
+    SchedulePumpPendingCalls();
   };
-  // GOAWAY (design §4.2): the session marks itself draining — in-flight
-  // calls run to completion, while queued and new calls fail immediately with
-  // UNAVAILABLE. Reconnect-on-GOAWAY is M6.
-  hooks.on_goaway = [this](uint32_t, int32_t, bool) {
-    FailPendingCalls(StatusCode::kUnavailable, "server sent GOAWAY; no new streams");
+  // GOAWAY (§4.2, §5.2): runs inside an nghttp2 callback — never destroy or
+  // re-enter the session here; ProcessPendingGoaway() acts once it unwinds.
+  hooks.on_goaway = [this](uint32_t error_code, int32_t last_stream_id, bool too_many_pings) {
+    goaway_received_ = true;
+    goaway_last_stream_id_ = std::min(goaway_last_stream_id_, last_stream_id);
+    goaway_detail_ = "server sent GOAWAY (error_code=" + std::to_string(error_code) + ")";
+    if (too_many_pings && !goaway_too_many_pings_applied_) {
+      goaway_too_many_pings_applied_ = true;
+      const milliseconds old_time = effective_keepalive_time_;
+      effective_keepalive_time_ = DoubleKeepaliveTime(old_time);
+      effective_keepalive_time_ms_.store(effective_keepalive_time_.count(),
+                                         std::memory_order_relaxed);
+      std::fprintf(stderr,
+                   "egrpc: WARN: received GOAWAY(ENHANCE_YOUR_CALM/too_many_pings); doubling "
+                   "keepalive_time from %lld ms to %lld ms\n",
+                   static_cast<long long>(old_time.count()),
+                   static_cast<long long>(effective_keepalive_time_.count()));
+    }
+    pending_goaway_process_ = true;
   };
 
   Http2SessionOptions h2_opts = options_.http2;
   // §5.4: derived stream window, never smaller than max_receive_message_size + 5.
   h2_opts.initial_window_size = stream_window_;
+  // §5.2: carries any ENHANCE_YOUR_CALM doubling across reconnects.
+  h2_opts.keepalive_time = effective_keepalive_time_;
 
   h2_ = std::make_unique<Http2Session>(h2_opts, std::move(hooks), steady_clock::now());
   if (!h2_->ok()) {
-    TearDown(h2_->error());
+    EnterTransientFailure(h2_->error());
     return;
   }
 
   loop_.WatchFd(
-      sock_.fd(),
+      sock_->fd(),
       [this] {
         // Honor OpenSSL's pending-operation contract: when an SSL_write_ex or
         // SSL_read_ex returned WANT_READ/WANT_WRITE, poll ONLY the readiness
@@ -455,29 +632,25 @@ void ChannelImpl::StartSession() {
           return static_cast<short>(POLLOUT);
         }
         short events = POLLIN;
-        if (h2_->WantWrite()) events |= POLLOUT;
+        if (h2_ != nullptr && h2_->WantWrite()) events |= POLLOUT;
         return events;
       },
       [this](short revents) { OnSocketReady(revents); });
 
-  state_ = State::kReady;
-  FlushOutput();  // connection preface + SETTINGS
-  RearmKeepalive();
-
-  // Pending calls stay queued until server SETTINGS arrives (or submit
-  // immediately if already received) via PumpPendingCalls.
-  PumpPendingCalls();
-  if (state_ == State::kReady) FlushOutput();
+  // Connection preface + SETTINGS. State stays CONNECTING until the server's
+  // SETTINGS arrives (on_remote_settings); pending calls are pumped then.
+  FlushOutput();
 }
 
 void ChannelImpl::OnSocketReady(short revents) {
+  if (!HasLiveSession()) return;
   // Retry an interrupted OpenSSL write before issuing any SSL_read_ex.
   if (tls_write_pending_) {
     const bool write_ready =
         (revents & (POLLERR | POLLHUP)) != 0 ||
         (tls_write_wants_read_ ? (revents & POLLIN) != 0 : (revents & POLLOUT) != 0);
     if (write_ready) FlushOutput();
-    if (state_ != State::kReady) return;
+    if (!HasLiveSession()) return;
     if (tls_write_pending_) {
       RearmKeepalive();
       return;
@@ -487,14 +660,16 @@ void ChannelImpl::OnSocketReady(short revents) {
   const bool want_read = tls_read_wants_write_ ? (revents & (POLLOUT | POLLERR | POLLHUP)) != 0
                                                : (revents & (POLLIN | POLLERR | POLLHUP)) != 0;
   if (want_read) DrainSocket();
-  if (state_ == State::kReady) ProcessPendingIgnoredConsumes();
-  if (state_ == State::kReady) ProcessPendingProtocolResets();
-  if (state_ == State::kReady) ProcessPendingStreamResets();
+  // All Http2Session callbacks have unwound from here on.
+  if (HasLiveSession()) ProcessPendingIgnoredConsumes();
+  if (HasLiveSession()) ProcessPendingProtocolResets();
+  if (HasLiveSession()) ProcessPendingStreamResets();
+  if (HasLiveSession()) ProcessPendingGoaway();
   // Stream closes, protocol resets, and server SETTINGS can open admission
-  // slots. Safe here: all Http2Session callbacks have unwound.
-  if (state_ == State::kReady) PumpPendingCalls();
-  if (state_ == State::kReady && !tls_read_wants_write_) FlushOutput();
-  if (state_ == State::kReady) RearmKeepalive();
+  // slots (or finish a GOAWAY drain).
+  if (HasLiveSession()) PumpPendingCalls();
+  if (HasLiveSession() && !tls_read_wants_write_) FlushOutput();
+  RearmKeepalive();
 }
 
 void ChannelImpl::ProcessPendingIgnoredConsumes() {
@@ -506,23 +681,7 @@ void ChannelImpl::ProcessPendingIgnoredConsumes() {
       h2_->ConsumeStream(entry.first, entry.second);
     }
   }
-  if (state_ == State::kReady && !tls_read_wants_write_) FlushOutput();
-}
-
-void ChannelImpl::FailPendingCalls(StatusCode code, const std::string& message) {
-  auto pending = std::move(pending_calls_);
-  pending_calls_.clear();
-  const auto now = steady_clock::now();
-  for (PendingCall& pc : pending) {
-    if (pc.deadline_timer != 0) loop_.CancelTimer(pc.deadline_timer);
-    if (pc.completion->cancel_requested()) {
-      CloseCompletionLocal(pc.completion, StatusCode::kCancelled, "Cancelled");
-    } else if (pc.deadline.has_value() && now >= *pc.deadline) {
-      CloseCompletionLocal(pc.completion, StatusCode::kDeadlineExceeded, "Deadline Exceeded");
-    } else {
-      CloseCompletionLocal(pc.completion, code, message);
-    }
-  }
+  if (HasLiveSession() && !tls_read_wants_write_) FlushOutput();
 }
 
 void ChannelImpl::ProcessPendingProtocolResets() {
@@ -542,7 +701,7 @@ void ChannelImpl::ProcessPendingProtocolResets() {
       any_reset = true;
     }
   }
-  if (any_reset && state_ == State::kReady && !tls_read_wants_write_) {
+  if (any_reset && HasLiveSession() && !tls_read_wants_write_) {
     // Flush RST_STREAM before PumpPendingCalls so nghttp2 frees the stream.
     FlushOutput();
   }
@@ -559,8 +718,97 @@ void ChannelImpl::ProcessPendingStreamResets() {
       any_reset = true;
     }
   }
-  if (any_reset && state_ == State::kReady && !tls_read_wants_write_) {
+  if (any_reset && HasLiveSession() && !tls_read_wants_write_) {
     FlushOutput();
+  }
+}
+
+void ChannelImpl::ProcessPendingGoaway() {
+  if (!pending_goaway_process_ || !HasLiveSession()) return;
+  pending_goaway_process_ = false;
+
+  // 1. Queued calls can never use this connection: fail-fast ones fail now,
+  //    wait-for-ready ones wait for the replacement (§4.4).
+  FailPendingCalls(StatusCode::kUnavailable, goaway_detail_, /*keep_wait_for_ready=*/true);
+
+  // 2. Streams above last_stream_id were never processed by the server; fail
+  //    them now rather than waiting out the drain. (nghttp2 normally already
+  //    closed them with REFUSED_STREAM; this covers any it did not.)
+  for (auto it = active_calls_.begin(); it != active_calls_.end();) {
+    if (it->second->stream_id() <= goaway_last_stream_id_) {
+      ++it;
+      continue;
+    }
+    std::unique_ptr<CallState> call = std::move(it->second);
+    it = active_calls_.erase(it);
+    if (call->deadline_timer() != 0) loop_.CancelTimer(call->deadline_timer());
+    if (call->stream_id() > 0) h2_->ResetStream(call->stream_id(), Http2Session::kHttp2Cancel);
+    if (!call->TryPreemptTerminal()) call->FailLocal(StatusCode::kUnavailable, goaway_detail_);
+  }
+
+  // 3. Nothing left to drain: replace the connection now.
+  if (active_calls_.empty()) {
+    EnterTransientFailure(goaway_detail_);
+    return;
+  }
+
+  // 4. Bounded drain of streams <= last_stream_id (armed once across
+  //    repeated GOAWAY frames).
+  if (goaway_drain_timer_ == 0) {
+    goaway_drain_timer_ =
+        loop_.AddTimer(std::max(options_.goaway_drain_timeout, milliseconds(0)), [this] {
+          goaway_drain_timer_ = 0;
+          if (HasLiveSession() && goaway_received_) {
+            EnterTransientFailure("GOAWAY drain timeout exceeded");
+          }
+        });
+  }
+}
+
+void ChannelImpl::FailPendingCall(PendingCall& pc, StatusCode code, const std::string& message) {
+  if (pc.deadline_timer != 0) {
+    loop_.CancelTimer(pc.deadline_timer);
+    pc.deadline_timer = 0;
+  }
+  if (pc.completion->cancel_requested()) {
+    CloseCompletionLocal(pc.completion, StatusCode::kCancelled, "Cancelled");
+  } else if (pc.deadline.has_value() && steady_clock::now() >= *pc.deadline) {
+    CloseCompletionLocal(pc.completion, StatusCode::kDeadlineExceeded, "Deadline Exceeded");
+  } else {
+    CloseCompletionLocal(pc.completion, code, message);
+  }
+}
+
+void ChannelImpl::FailPendingCalls(StatusCode code, const std::string& message,
+                                   bool keep_wait_for_ready) {
+  auto pending = std::move(pending_calls_);
+  pending_calls_.clear();
+  for (PendingCall& pc : pending) {
+    if (keep_wait_for_ready && pc.wait_for_ready) {
+      pending_calls_.push_back(std::move(pc));
+    } else {
+      FailPendingCall(pc, code, message);
+    }
+  }
+}
+
+void ChannelImpl::FailActiveCalls(const std::string& message) {
+  auto active = std::move(active_calls_);
+  active_calls_.clear();
+  for (auto& entry : active) {
+    if (entry.second->deadline_timer() != 0) loop_.CancelTimer(entry.second->deadline_timer());
+    if (!entry.second->TryPreemptTerminal()) {
+      entry.second->FailLocal(StatusCode::kUnavailable, message);
+    }
+  }
+}
+
+void ChannelImpl::FailDrainingCalls(const std::string& message) {
+  auto draining = std::move(draining_calls_);
+  draining_calls_.clear();
+  for (auto& entry : draining) {
+    if (entry.second->deadline_timer() != 0) loop_.CancelTimer(entry.second->deadline_timer());
+    entry.second->FailLocal(StatusCode::kUnavailable, message);
   }
 }
 
@@ -577,10 +825,9 @@ void ChannelImpl::SubmitCall(PendingCall pc) {
     CloseCompletionLocal(pc.completion, StatusCode::kCancelled, "Cancelled");
     return;
   }
-  if (state_ != State::kReady || h2_ == nullptr) {
+  if (state_ != ConnectivityState::kReady || h2_ == nullptr || goaway_received_) {
     cancel_pending_timer();
-    CloseCompletionLocal(pc.completion, StatusCode::kUnavailable,
-                         state_ == State::kFailed ? failure_detail_ : "channel is not ready");
+    CloseCompletionLocal(pc.completion, StatusCode::kUnavailable, "channel is not ready");
     return;
   }
 
@@ -644,7 +891,7 @@ void ChannelImpl::SubmitCall(PendingCall pc) {
   auto finish_active_call = [this, cid](uint32_t error_code, bool from_end_stream) {
     auto it = active_calls_.find(cid);
     if (it == active_calls_.end()) {
-      if (!pending_calls_.empty()) SchedulePumpPendingCalls();
+      SchedulePumpPendingCalls();
       return;
     }
     std::unique_ptr<CallState> c = std::move(it->second);
@@ -671,7 +918,10 @@ void ChannelImpl::SubmitCall(PendingCall pc) {
       // RST_STREAM(CANCEL) once ReceiveBytes() unwinds to release the stream.
       pending_stream_resets_.push_back(sid);
     }
-    if (!pending_calls_.empty()) SchedulePumpPendingCalls();
+    // Deferred (we are inside an nghttp2 callback): admit queued calls into
+    // the freed slot, finish a GOAWAY drain, and re-arm keepalive for the
+    // 1 → 0 active-stream transition.
+    SchedulePumpPendingCalls();
   };
   hooks.on_response_end_stream = [finish_active_call]() {
     finish_active_call(/*error_code=*/0, /*from_end_stream=*/true);
@@ -696,26 +946,56 @@ void ChannelImpl::SubmitCall(PendingCall pc) {
 
 void ChannelImpl::FlushOutput() {
   if (tls_read_wants_write_) return;
-  while (state_ == State::kReady) {
+  // Bound writes per event-loop turn (mirrors DrainSocket()'s read bound) so
+  // a huge outbound payload cannot starve Shutdown, Cancel, or deadline
+  // timers; the remainder is flushed by a next-turn continuation.
+  constexpr size_t kMaxWriteBytesPerTurn = 256 * 1024;
+  size_t bytes_written_this_turn = 0;
+  while (HasLiveSession()) {
+    // Shutdown() is pending: let DoShutdown() run without delay.
+    if (shutting_down_.load(std::memory_order_acquire)) return;
+    if (bytes_written_this_turn >= kMaxWriteBytesPerTurn) {
+      // Budget spent: do not refill h2_'s output buffer this turn.
+      if (!h2_->WantWrite()) {
+        if (!h2_->error().empty()) {
+          EnterTransientFailure(h2_->error());
+        } else if (!h2_->WantRead()) {
+          EnterTransientFailure(goaway_received_ ? goaway_detail_ : "HTTP/2 session terminated");
+        }
+        return;
+      }
+      // Resume after queued ops and due timers have run.
+      if (!write_yield_pending_) {
+        write_yield_pending_ = true;
+        loop_.ScheduleNextTurn([this] {
+          if (!write_yield_pending_) return;
+          write_yield_pending_ = false;
+          if (!HasLiveSession() || tls_write_pending_) return;
+          FlushOutput();
+          RearmKeepalive();
+        });
+      }
+      return;
+    }
     size_t len = 0;
     const uint8_t* data = h2_->PendingOutput(&len);
     if (data == nullptr || len == 0) {
       tls_write_pending_ = false;
       tls_write_wants_read_ = false;
       if (!h2_->error().empty()) {
-        TearDown(h2_->error());
+        EnterTransientFailure(h2_->error());
       } else if (!h2_->WantRead() && !h2_->WantWrite()) {
-        TearDown(h2_->draining() ? "server sent GOAWAY; session closed"
-                                 : "HTTP/2 session terminated");
+        EnterTransientFailure(goaway_received_ ? goaway_detail_ : "HTTP/2 session terminated");
       }
       return;
     }
     size_t written = 0;
-    const TlsSocket::IoStatus st = sock_.Write(data, len, &written);
+    const TlsSocket::IoStatus st = sock_->Write(data, len, &written);
     if (st == TlsSocket::IoStatus::kOk) {
       tls_write_pending_ = false;
       tls_write_wants_read_ = false;
       h2_->ConsumeOutput(written);
+      bytes_written_this_turn += written;
       continue;
     }
     if (st == TlsSocket::IoStatus::kWantWrite) {
@@ -728,7 +1008,7 @@ void ChannelImpl::FlushOutput() {
       tls_write_wants_read_ = true;
       return;  // wait for POLLIN and retry SSL_write_ex first
     }
-    TearDown(sock_.error());
+    EnterTransientFailure(sock_->error().empty() ? "socket write failed" : sock_->error());
     return;
   }
 }
@@ -740,23 +1020,24 @@ void ChannelImpl::DrainSocket() {
   // next-turn continuation so queued ops and due timers run first.
   constexpr int kMaxChunksPerTurn = 16;
   uint8_t buf[16384];
-  for (int i = 0; i < kMaxChunksPerTurn && state_ == State::kReady; ++i) {
+  for (int i = 0; i < kMaxChunksPerTurn && HasLiveSession(); ++i) {
     size_t n = 0;
-    const TlsSocket::IoStatus st = sock_.Read(buf, sizeof(buf), &n);
+    const TlsSocket::IoStatus st = sock_->Read(buf, sizeof(buf), &n);
     if (st == TlsSocket::IoStatus::kOk) {
       tls_read_wants_write_ = false;
       if (!h2_->ReceiveBytes(steady_clock::now(), buf, n)) {
-        TearDown(h2_->error());
+        EnterTransientFailure(h2_->error());
         return;
       }
       if (!h2_->WantRead() && !h2_->WantWrite()) {
-        TearDown(h2_->draining() ? "server sent GOAWAY; session closed"
-                                 : "HTTP/2 session terminated");
+        // Nothing left to exchange on this connection (e.g. GOAWAY with no
+        // streams left to drain): replace it.
+        EnterTransientFailure(goaway_received_ ? goaway_detail_ : "HTTP/2 session terminated");
         return;
       }
       if (!pending_ignored_consumes_.empty()) {
         ProcessPendingIgnoredConsumes();
-        if (state_ != State::kReady || tls_write_pending_) return;
+        if (!HasLiveSession() || tls_write_pending_) return;
       }
       continue;
     }
@@ -769,107 +1050,124 @@ void ChannelImpl::DrainSocket() {
       return;  // poll arms POLLOUT and retries DrainSocket() on readiness
     }
     if (st == TlsSocket::IoStatus::kEof) {
-      TearDown("connection closed by server");
+      EnterTransientFailure("connection closed by server");
       return;
     }
-    TearDown(sock_.error());
+    EnterTransientFailure(sock_->error().empty() ? "socket read failed" : sock_->error());
     return;
   }
-  if (state_ == State::kReady && !read_yield_pending_) {
+  if (HasLiveSession() && !read_yield_pending_) {
     read_yield_pending_ = true;
     loop_.ScheduleNextTurn([this] {
       if (!read_yield_pending_) return;
       read_yield_pending_ = false;
-      if (state_ == State::kReady) OnSocketReady(POLLIN);
+      if (HasLiveSession()) OnSocketReady(POLLIN);
     });
   }
 }
 
 void ChannelImpl::RearmKeepalive() {
-  if (state_ != State::kReady || h2_ == nullptr) return;
+  if (state_ != ConnectivityState::kReady || h2_ == nullptr) return;
   if (keepalive_timer_ != 0) {
     loop_.CancelTimer(keepalive_timer_);
     keepalive_timer_ = 0;
   }
-  const auto deadline = h2_->NextKeepaliveDeadline(steady_clock::now());
+  const auto now = steady_clock::now();
+  const auto deadline = h2_->NextKeepaliveDeadline(now);
   if (!deadline) return;
-  keepalive_timer_ = loop_.AddTimer(*deadline - steady_clock::now(), [this] {
+  const auto delay = *deadline > now ? *deadline - now : steady_clock::duration::zero();
+  keepalive_timer_ = loop_.AddTimer(delay, [this] {
     keepalive_timer_ = 0;
-    if (state_ != State::kReady || h2_ == nullptr) return;
-    switch (h2_->CheckKeepalive(steady_clock::now())) {
-      case Http2Session::KeepaliveAction::kDead:
-        TearDown("keepalive timeout: no reads from server within keepalive_timeout");
-        return;
-      case Http2Session::KeepaliveAction::kPingSent:
-      case Http2Session::KeepaliveAction::kNone:
-        break;
+    if (state_ != ConnectivityState::kReady || h2_ == nullptr) return;
+    // §5.2: runs with or without calls in flight (permit_without_calls).
+    if (h2_->CheckKeepalive(steady_clock::now()) == Http2Session::KeepaliveAction::kDead) {
+      EnterTransientFailure("keepalive timeout: no response from peer within keepalive_timeout");
+      return;
     }
     FlushOutput();  // a queued PING must go out even if the loop is idle
     RearmKeepalive();
   });
 }
 
-void ChannelImpl::TearDown(std::string detail, bool finalize_draining) {
-  if (state_ == State::kFailed || state_ == State::kShutdown) {
-    if (finalize_draining) {
-      auto draining = std::move(draining_calls_);
-      draining_calls_.clear();
-      for (auto& entry : draining) {
-        if (entry.second->deadline_timer() != 0) loop_.CancelTimer(entry.second->deadline_timer());
-        entry.second->FailLocal(StatusCode::kUnavailable, detail);
-      }
-    }
-    return;
-  }
-  state_ = State::kFailed;
-  failure_detail_ = std::move(detail);
-  {
-    std::lock_guard<std::mutex> lock(terminal_error_mu_);
-    terminal_error_ = failure_detail_;
-  }
+void ChannelImpl::EnterTransientFailure(std::string detail) {
+  if (state_ == ConnectivityState::kShutdown) return;
+  SetState(ConnectivityState::kTransientFailure);
+  last_failure_detail_ = std::move(detail);
 
+  // Captured before CancelTimersAndUnwatch() clears the flags: an SSL_read_ex
+  // or SSL_write_ex awaiting retry forbids SSL_shutdown (OpenSSL's
+  // pending-operation contract), so such a socket is closed abortively.
+  const bool ssl_op_pending = tls_read_wants_write_ || tls_write_pending_;
   CancelTimersAndUnwatch();
-  sock_.Close();
-  // Safe: TearDown is never reached from inside an Http2Session callback —
-  // ReceiveBytes/PendingOutput report failure via return value first.
-  h2_.reset();
+  if (resolving_dns_) {
+    resolver_.Invalidate();
+    resolving_dns_ = false;
+  }
+  goaway_received_ = false;
+  pending_goaway_process_ = false;
+  goaway_too_many_pings_applied_ = false;
+  goaway_last_stream_id_ = std::numeric_limits<int32_t>::max();
   pending_ignored_consumes_.clear();
   pending_protocol_resets_.clear();
   pending_stream_resets_.clear();
+  // Safe: never reached from inside an Http2Session callback — ReceiveBytes /
+  // PendingOutput report failure via return value first, and GOAWAY handling
+  // is deferred to ProcessPendingGoaway().
+  h2_.reset();
+  if (sock_ != nullptr) {
+    sock_->Close(/*graceful=*/!ssl_op_pending);
+    sock_.reset();
+  }
 
-  auto active = std::move(active_calls_);
-  active_calls_.clear();
-  for (auto& entry : active) {
-    if (entry.second->deadline_timer() != 0) loop_.CancelTimer(entry.second->deadline_timer());
-    if (!entry.second->TryPreemptTerminal()) {
-      entry.second->FailLocal(StatusCode::kUnavailable, failure_detail_);
-    }
+  FailActiveCalls(last_failure_detail_);
+  // Wire-complete draining_calls_ already received all bytes and trailers;
+  // they keep draining locally so a peer closing the socket right after
+  // END_STREAM cannot clobber a completed RPC.
+  FailPendingCalls(StatusCode::kUnavailable, last_failure_detail_,
+                   /*keep_wait_for_ready=*/true);
+
+  const Backoff::Step step = backoff_.OnFailure(steady_clock::now());
+  reconnect_timer_ = loop_.AddTimer(step.delay, [this] {
+    reconnect_timer_ = 0;
+    if (state_ == ConnectivityState::kTransientFailure) StartConnecting();
+  });
+}
+
+void ChannelImpl::FatalLoopExit(std::string detail) {
+  SetState(ConnectivityState::kShutdown);
+  last_failure_detail_ = std::move(detail);
+  {
+    std::lock_guard<std::mutex> lock(terminal_error_mu_);
+    terminal_error_ = last_failure_detail_;
   }
-  // Wire-complete draining_calls_ already received all bytes and trailers on
-  // the wire; leave them draining locally on transport teardown so a peer
-  // closing the socket right after END_STREAM cannot clobber a completed RPC.
-  // Only fail them with kUnavailable if the EventThread itself is exiting on a
-  // fatal poll() error (so undelivered scanner bytes are never silently
-  // truncated with OK).
-  if (finalize_draining) {
-    auto draining = std::move(draining_calls_);
-    draining_calls_.clear();
-    for (auto& entry : draining) {
-      if (entry.second->deadline_timer() != 0) loop_.CancelTimer(entry.second->deadline_timer());
-      entry.second->FailLocal(StatusCode::kUnavailable, failure_detail_);
-    }
+  const bool ssl_op_pending = tls_read_wants_write_ || tls_write_pending_;
+  CancelTimersAndUnwatch();
+  resolving_dns_ = false;
+  resolver_.Shutdown(std::chrono::milliseconds(0));
+  h2_.reset();
+  if (sock_ != nullptr) {
+    sock_->Close(/*graceful=*/!ssl_op_pending);
+    sock_.reset();
   }
-  FailPendingCalls(StatusCode::kUnavailable, failure_detail_);
+  pending_ignored_consumes_.clear();
+  pending_protocol_resets_.clear();
+  pending_stream_resets_.clear();
+  // The EventThread is exiting: nothing can drive draining calls further, so
+  // fail them too rather than silently truncating unread messages with OK.
+  FailActiveCalls(last_failure_detail_);
+  FailDrainingCalls(last_failure_detail_);
+  FailPendingCalls(StatusCode::kUnavailable, last_failure_detail_);
 }
 
 void ChannelImpl::CancelTimersAndUnwatch() {
-  for (TimerId* t : {&connect_timer_, &keepalive_timer_}) {
+  for (TimerId* t : {&connect_timer_, &keepalive_timer_, &reconnect_timer_, &goaway_drain_timer_}) {
     if (*t != 0) {
       loop_.CancelTimer(*t);
       *t = 0;
     }
   }
   read_yield_pending_ = false;
+  write_yield_pending_ = false;
   pump_scheduled_ = false;
   tls_read_wants_write_ = false;
   tls_write_pending_ = false;
@@ -878,54 +1176,82 @@ void ChannelImpl::CancelTimersAndUnwatch() {
 }
 
 void ChannelImpl::DoShutdown() {
-  if (state_ == State::kShutdown) return;
-  // Only attempt best-effort GOAWAY write if no OpenSSL read/write retry is
-  // currently in flight (honoring OpenSSL's pending-operation contract).
+  // Only attempt the best-effort GOAWAY write if no OpenSSL read/write retry
+  // is in flight (honoring OpenSSL's pending-operation contract).
+  bool ssl_op_pending = tls_read_wants_write_ || tls_write_pending_;
   const bool can_send_goaway =
-      state_ == State::kReady && h2_ != nullptr && !tls_read_wants_write_ && !tls_write_pending_;
-  state_ = State::kShutdown;
+      HasLiveSession() && sock_->state() == TlsSocket::State::kConnected && !ssl_op_pending;
+  SetState(ConnectivityState::kShutdown);
+  DrainCancelQueue();  // settle already-requested cancels as CANCELLED
   ClearCancelQueue();
-  pending_ignored_consumes_.clear();
-  pending_protocol_resets_.clear();
-  pending_stream_resets_.clear();
-
-  // §5.7: unblock every waiter first.
-  auto active = std::move(active_calls_);
-  active_calls_.clear();
-  for (auto& entry : active) {
-    if (entry.second->deadline_timer() != 0) loop_.CancelTimer(entry.second->deadline_timer());
-    if (!entry.second->TryPreemptTerminal()) {
-      entry.second->FailLocal(StatusCode::kUnavailable, "channel is shut down");
-    }
-  }
-  // Draining calls still hold undelivered messages in EventThread-owned
-  // scanner_; because the EventThread is exiting, fail them with UNAVAILABLE
-  // (§5.7) rather than silently truncating unread messages with Status::OK.
-  auto draining = std::move(draining_calls_);
-  draining_calls_.clear();
-  for (auto& entry : draining) {
-    if (entry.second->deadline_timer() != 0) loop_.CancelTimer(entry.second->deadline_timer());
-    entry.second->FailLocal(StatusCode::kUnavailable, "channel is shut down");
-  }
-  FailPendingCalls(StatusCode::kUnavailable, "channel is shut down");
-
   CancelTimersAndUnwatch();
 
+  const milliseconds budget = std::max(options_.shutdown_timeout, milliseconds(0));
+  // Shutdown() stamped the absolute deadline before queuing us; ops that ran
+  // ahead of DoShutdown() already consumed part of the budget.
+  const int64_t deadline_ticks = shutdown_deadline_ns_.load(std::memory_order_acquire);
+  const auto shutdown_deadline =
+      deadline_ticks != 0 ? steady_clock::time_point(steady_clock::duration(deadline_ticks))
+                          : steady_clock::now() + budget;
+
+  // §5.7: unblock every waiter first, before any socket/DNS teardown.
+  FailActiveCalls(kShutDownMessage);
+  // Draining calls still hold undelivered messages in EventThread-owned
+  // scanner_; because the EventThread is exiting, fail them with UNAVAILABLE
+  // rather than silently truncating unread messages with Status::OK.
+  FailDrainingCalls(kShutDownMessage);
+  FailPendingCalls(StatusCode::kUnavailable, kShutDownMessage);
+
+  // Never block on a hung getaddrinfo(): join an idle worker within a short
+  // grace, detach a mid-resolve one (§4.1).
+  resolving_dns_ = false;
+  const auto now = steady_clock::now();
+  const milliseconds remaining =
+      shutdown_deadline > now ? std::chrono::duration_cast<milliseconds>(shutdown_deadline - now)
+                              : milliseconds(0);
+  const milliseconds sub_budget =
+      std::max(std::min({milliseconds(50), budget / 4, remaining}), milliseconds(0));
+  resolver_.Shutdown(sub_budget);
+
   if (can_send_goaway) {
-    // Graceful close: GOAWAY(NO_ERROR) + one non-blocking flush pass (§5.7 —
-    // best-effort, bounded; no waiting for the peer).
+    // Graceful close: GOAWAY(NO_ERROR) + flush bounded by a short sub-budget
+    // (best-effort; no waiting for the peer).
+    const auto close_deadline = std::min(shutdown_deadline, steady_clock::now() + sub_budget);
     h2_->Terminate();
     for (;;) {
+      // Checked every iteration (also after kOk writes) so a peer that keeps
+      // accepting bytes cannot stretch the flush past its budget.
+      if (steady_clock::now() >= close_deadline) break;
       size_t len = 0;
       const uint8_t* data = h2_->PendingOutput(&len);
       if (data == nullptr || len == 0) break;
       size_t written = 0;
-      if (sock_.Write(data, len, &written) != TlsSocket::IoStatus::kOk) break;
-      h2_->ConsumeOutput(written);
+      const TlsSocket::IoStatus st = sock_->Write(data, len, &written);
+      if (st == TlsSocket::IoStatus::kOk) {
+        ssl_op_pending = false;
+        h2_->ConsumeOutput(written);
+        continue;
+      }
+      if (st != TlsSocket::IoStatus::kWantWrite && st != TlsSocket::IoStatus::kWantRead) break;
+      // SSL_write_ex must be retried before any SSL_shutdown; if we give up
+      // here the close has to be abortive.
+      ssl_op_pending = true;
+      const int rem_ms = RemainingMs(close_deadline);
+      if (rem_ms <= 0) break;
+      pollfd pfd{};
+      pfd.fd = sock_->fd();
+      pfd.events = st == TlsSocket::IoStatus::kWantWrite ? POLLOUT : POLLIN;
+      if (poll(&pfd, 1, rem_ms) <= 0) break;
     }
   }
-  sock_.Close();
   h2_.reset();
+  if (sock_ != nullptr) {
+    sock_->Close(/*graceful=*/!ssl_op_pending);
+    sock_.reset();
+  }
+  pending_ignored_consumes_.clear();
+  pending_protocol_resets_.clear();
+  pending_stream_resets_.clear();
 }
 
 }  // namespace internal

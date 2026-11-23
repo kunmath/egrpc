@@ -109,8 +109,10 @@ class ClientStreamRawImpl final : public ClientStreamRaw {
         completion_(std::move(completion)),
         max_receive_message_size_(max_receive_message_size) {}
 
-  explicit ClientStreamRawImpl(Status lame_status)
-      : saw_eof_(true), lame_status_(std::move(lame_status)) {}
+  // Locally-failed reader (lame channel, expired deadline, pre-cancel, ...).
+  // `context` may be null; when set, Finish() marks its status local.
+  ClientStreamRawImpl(ClientContext* context, Status lame_status)
+      : context_(context), saw_eof_(true), lame_status_(std::move(lame_status)) {}
 
   ~ClientStreamRawImpl() override {
     // §5.8: destroying a ClientReader without Finish() performs non-blocking
@@ -180,7 +182,10 @@ class ClientStreamRawImpl final : public ClientStreamRaw {
   Status Finish() override {
     assert(!finished_ && "ClientReader::Finish() called more than once");
     finished_ = true;
-    if (lame_status_.has_value()) return *lame_status_;
+    if (lame_status_.has_value()) {
+      if (context_ != nullptr) context_->egrpc_status_is_local_ = true;
+      return *lame_status_;
+    }
 
     // §5.8: calling Finish() without draining cancels-and-discards so
     // Read-driven HTTP/2 flow control cannot deadlock.
@@ -199,6 +204,10 @@ class ClientStreamRawImpl final : public ClientStreamRaw {
 
     if (context_ != nullptr) {
       context_->UnbindCancel();
+      // A local override (e.g. a response that failed to parse) wins over
+      // whatever terminal status the wire produced.
+      context_->egrpc_status_is_local_ =
+          local_error_override_.has_value() || r.origin == egrpc::internal::StatusOrigin::kLocal;
       if (!initial_metadata_deposited_) {
         DepositMetadata(r.initial_metadata, &context_->recv_initial_metadata_,
                         &context_->recv_initial_view_);
@@ -259,6 +268,8 @@ std::shared_ptr<Channel> Channel::Lame(Status lame_status) {
 
 Status Channel::BlockingUnaryCallShim(const internal::RpcMethod& method, ClientContext* context,
                                       const std::string& request, std::string* response) {
+  // Every early return below is a locally-generated status.
+  context->egrpc_status_is_local_ = true;
   if (!impl_) return lame_status_;
 
   std::optional<std::chrono::steady_clock::time_point> deadline;
@@ -279,9 +290,11 @@ Status Channel::BlockingUnaryCallShim(const internal::RpcMethod& method, ClientC
   }
 
   (void)impl_->StartCall(egrpc::internal::CallMode::kUnary, method.name(), request,
-                         std::move(metadata), deadline, call_id, completion);
+                         std::move(metadata), deadline, call_id, completion,
+                         context->wait_for_ready_);
   const egrpc::internal::CallCompletion::Result& result = completion->Wait();
   context->UnbindCancel();
+  context->egrpc_status_is_local_ = (result.origin == egrpc::internal::StatusOrigin::kLocal);
 
   DepositMetadata(result.initial_metadata, &context->recv_initial_metadata_,
                   &context->recv_initial_view_);
@@ -297,19 +310,20 @@ Status Channel::BlockingUnaryCallShim(const internal::RpcMethod& method, ClientC
 
 std::unique_ptr<internal::ClientStreamRaw> Channel::StartServerStreamShim(
     const internal::RpcMethod& method, ClientContext* context, const std::string& request) {
-  if (!impl_) return std::make_unique<internal::ClientStreamRawImpl>(lame_status_);
+  // Local early returns are marked local by ClientStreamRawImpl::Finish().
+  if (!impl_) return std::make_unique<internal::ClientStreamRawImpl>(context, lame_status_);
 
   std::optional<std::chrono::steady_clock::time_point> deadline;
   if (!ComputeDeadline(context->deadline_, &deadline)) {
     return std::make_unique<internal::ClientStreamRawImpl>(
-        Status(StatusCode::DEADLINE_EXCEEDED, "Deadline Exceeded"));
+        context, Status(StatusCode::DEADLINE_EXCEEDED, "Deadline Exceeded"));
   }
 
   const uint64_t call_id = impl_->AllocateCallId();
   auto completion = std::make_shared<egrpc::internal::CallCompletion>(call_id);
   if (context->BindCancel(MakeCancelHook(impl_, completion))) {
     return std::make_unique<internal::ClientStreamRawImpl>(
-        Status(StatusCode::CANCELLED, "Cancelled"));
+        context, Status(StatusCode::CANCELLED, "Cancelled"));
   }
 
   egrpc::internal::Http2Session::HeaderList metadata;
@@ -319,7 +333,8 @@ std::unique_ptr<internal::ClientStreamRaw> Channel::StartServerStreamShim(
   }
 
   (void)impl_->StartCall(egrpc::internal::CallMode::kServerStreaming, method.name(), request,
-                         std::move(metadata), deadline, call_id, completion);
+                         std::move(metadata), deadline, call_id, completion,
+                         context->wait_for_ready_);
 
   const size_t max_recv = impl_->max_receive_message_size();
   const uint32_t max_recv_u32 = max_recv >= std::numeric_limits<uint32_t>::max()
@@ -336,6 +351,7 @@ Status BlockingUnaryCallRaw(ChannelInterface* channel, const RpcMethod& method,
                             std::string* response) {
   auto* egrpc_channel = dynamic_cast<Channel*>(channel);
   if (egrpc_channel == nullptr) {
+    ClientContextAccess::MarkStatusLocal(context);
     return Status(StatusCode::INTERNAL, "channel was not created by egrpc's grpc::CreateChannel");
   }
   return egrpc_channel->BlockingUnaryCallShim(method, context, request, response);
@@ -348,6 +364,7 @@ std::unique_ptr<ClientStreamRaw> StartServerStreamRaw(ChannelInterface* channel,
   auto* egrpc_channel = dynamic_cast<Channel*>(channel);
   if (egrpc_channel == nullptr) {
     return std::make_unique<ClientStreamRawImpl>(
+        context,
         Status(StatusCode::INTERNAL, "channel was not created by egrpc's grpc::CreateChannel"));
   }
   return egrpc_channel->StartServerStreamShim(method, context, request);
