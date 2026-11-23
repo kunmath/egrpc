@@ -33,7 +33,6 @@
 #include <arpa/inet.h>
 #include <grpcpp/grpcpp.h>
 #include <netinet/in.h>
-#include <poll.h>
 #include <sys/socket.h>
 
 #include <algorithm>
@@ -58,6 +57,7 @@
 
 #include "core/call_state.h"
 #include "core/channel_impl.h"
+#include "core/event_thread.h"
 #include "route_guide.grpc.pb.h"
 #include "route_guide.pb.h"
 #include "transport/dns_resolver.h"
@@ -755,9 +755,10 @@ int RunPrecancelLocalOrigin(const Args& a) {
 
 // Fix #5: TlsSocket::StartConnect(host, {addr1, addr2, ...}) where earlier
 // addresses accept TCP but fail the TLS handshake or ALPN must fall back to
-// the next address. Drives the socket directly on this thread (its sole
-// owner) with a poll() loop that re-reads fd() every turn, since a fallback
-// replaces the fd.
+// the next address. Drives the socket on an EventThread (its real production
+// owner, which blocks SIGPIPE so peer-reset writes return EPIPE instead of
+// killing the process) and re-watches the fd whenever address fallback opens
+// a new socket.
 const char* TlsStateName(egrpc::internal::TlsSocket::State s) {
   using S = egrpc::internal::TlsSocket::State;
   switch (s) {
@@ -778,8 +779,11 @@ const char* TlsStateName(egrpc::internal::TlsSocket::State s) {
 }
 
 int RunTlsAddrFallback(const Args& a) {
+  using egrpc::internal::EventThread;
   using egrpc::internal::ResolvedAddress;
+  using egrpc::internal::TimerId;
   using egrpc::internal::TlsSocket;
+
   std::vector<ResolvedAddress> addrs;
   for (uint16_t port : a.addr_ports) {
     ResolvedAddress ra;
@@ -794,44 +798,99 @@ int RunTlsAddrFallback(const Args& a) {
   egrpc::internal::TlsConfig tls;
   tls.ca_bundle_path = a.ca;
 
-  TlsSocket sock;
-  const bool started = sock.StartConnect(a.host, addrs, tls);
-  const auto deadline = Clock::now() + milliseconds(a.deadline_ms);
-  while (started && (sock.state() == TlsSocket::State::kTcpConnecting ||
-                     sock.state() == TlsSocket::State::kTlsHandshake)) {
-    const int64_t remaining = MsBetween(Clock::now(), deadline);
-    if (remaining <= 0) break;
-    pollfd p{};
-    p.fd = sock.fd();  // may change after a per-address fallback
-    p.events = sock.DesiredPollEvents();
-    const int rc = poll(&p, 1, static_cast<int>(std::min<int64_t>(remaining, 100)));
-    if (rc < 0) break;
-    if (rc == 0) continue;
-    const TlsSocket::IoStatus st = sock.ContinueConnect();
-    if (st == TlsSocket::IoStatus::kWantRead || st == TlsSocket::IoStatus::kWantWrite) continue;
-    break;
+  struct Outcome {
+    bool connected = false;
+    TlsSocket::State state = TlsSocket::State::kIdle;
+    std::string alpn;
+    int peer_port = 0;
+    std::string error;
+  };
+
+  EventThread loop;
+  if (!loop.Start()) {
+    std::fprintf(stderr, "could not start event thread\n");
+    return 1;
   }
 
-  const bool connected = sock.state() == TlsSocket::State::kConnected;
-  int peer_port = 0;
-  if (connected) {
-    sockaddr_storage peer{};
-    socklen_t len = sizeof(peer);
-    if (getpeername(sock.fd(), reinterpret_cast<sockaddr*>(&peer), &len) == 0 &&
-        peer.ss_family == AF_INET) {
-      sockaddr_in sin{};
-      std::memcpy(&sin, &peer, sizeof(sin));
-      peer_port = ntohs(sin.sin_port);
+  std::promise<Outcome> done;
+  auto future = done.get_future();
+
+  // State exclusively owned by the EventThread until loop.Stop() joins.
+  struct State {
+    TlsSocket sock;
+    TimerId timer = 0;
+    bool settled = false;
+    std::function<void()> watch_socket;
+  };
+  auto st_owner = std::make_unique<State>();
+
+  const bool posted = loop.Post([&loop, &a, &addrs, &tls, &done, s = st_owner.get()]() {
+    auto finish = [&loop, &done, s](const std::string& override_error) {
+      if (s->settled) return;
+      s->settled = true;
+      if (s->timer != 0) {
+        loop.CancelTimer(s->timer);
+        s->timer = 0;
+      }
+      loop.UnwatchFd();
+      Outcome out;
+      out.state = s->sock.state();
+      out.connected = (out.state == TlsSocket::State::kConnected);
+      if (out.connected) {
+        out.alpn = s->sock.alpn();
+        sockaddr_storage peer{};
+        socklen_t len = sizeof(peer);
+        if (getpeername(s->sock.fd(), reinterpret_cast<sockaddr*>(&peer), &len) == 0 &&
+            peer.ss_family == AF_INET) {
+          sockaddr_in sin{};
+          std::memcpy(&sin, &peer, sizeof(sin));
+          out.peer_port = ntohs(sin.sin_port);
+        }
+      }
+      out.error = override_error.empty() ? s->sock.error() : override_error;
+      s->sock.Close(/*graceful=*/false);
+      done.set_value(std::move(out));
+    };
+
+    s->timer = loop.AddTimer(milliseconds(a.deadline_ms), [finish] { finish("connect timeout"); });
+
+    if (!s->sock.StartConnect(a.host, addrs, tls)) {
+      finish("");
+      return;
     }
+
+    s->watch_socket = [&loop, s, finish]() {
+      loop.WatchFd(
+          s->sock.fd(), [s] { return s->sock.DesiredPollEvents(); },
+          [s, finish](short) {
+            if (s->settled) return;
+            const int prev_fd = s->sock.fd();
+            const TlsSocket::IoStatus st = s->sock.ContinueConnect();
+            if (st == TlsSocket::IoStatus::kWantRead || st == TlsSocket::IoStatus::kWantWrite) {
+              if (s->sock.fd() != prev_fd) s->watch_socket();
+              return;
+            }
+            finish("");
+          });
+    };
+    s->watch_socket();
+  });
+
+  if (!posted) {
+    loop.Stop();
+    std::fprintf(stderr, "event thread refused op\n");
+    return 1;
   }
-  std::string error = sock.error();
-  std::replace(error.begin(), error.end(), '\n', ' ');
-  std::printf("CONNECTED=%d\n", connected ? 1 : 0);
-  std::printf("TLS_STATE=%s\n", TlsStateName(sock.state()));
-  std::printf("ALPN=%s\n", connected ? sock.alpn().c_str() : "-");
-  std::printf("PEER_PORT=%d\n", peer_port);
-  std::printf("ERROR=%s\n", error.empty() ? "-" : error.c_str());
-  sock.Close();
+
+  Outcome out = future.get();
+  loop.Stop([&] { st_owner.reset(); });
+
+  std::replace(out.error.begin(), out.error.end(), '\n', ' ');
+  std::printf("CONNECTED=%d\n", out.connected ? 1 : 0);
+  std::printf("TLS_STATE=%s\n", TlsStateName(out.state));
+  std::printf("ALPN=%s\n", out.connected ? out.alpn.c_str() : "-");
+  std::printf("PEER_PORT=%d\n", out.peer_port);
+  std::printf("ERROR=%s\n", out.error.empty() ? "-" : out.error.c_str());
   return 0;
 }
 
