@@ -1,3 +1,20 @@
+# Copyright 2019 The gRPC Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Modified by the egrpc authors: the upstream TestService is wrapped in a
+# factory over on-the-fly generated stubs and embedded in a TLS test-server
+# harness (InteropTestServer); servicer logic is otherwise unchanged.
 """Upstream-grpcio TLS interop TestService server for egrpc M8.
 
 Compatibility oracle (design §7, Ring 3): serves the UNMODIFIED gRPC v1.82.0
