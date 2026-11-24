@@ -90,7 +90,8 @@ Existing client code keeps working; only the link line changes.
 
 int main() {
   grpc::SslCredentialsOptions ssl;
-  ssl.pem_root_certs = ReadFile("ca.pem");  // empty: system trust store
+  // Empty pem_root_certs uses the system trust store; for a private CA, set
+  // ssl.pem_root_certs to its PEM text.
   auto channel = grpc::CreateChannel("api.example.com:443", grpc::SslCredentials(ssl));
   auto stub = routeguide::RouteGuide::NewStub(channel);
 
