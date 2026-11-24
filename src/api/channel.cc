@@ -19,6 +19,7 @@
 #include <optional>
 #include <utility>
 
+#include "api/client_stream_raw_internal.h"
 #include "core/call_state.h"
 #include "core/channel_impl.h"
 #include "core/grpc_wire.h"
@@ -128,7 +129,9 @@ class ClientStreamRawImpl final : public ClientStreamRaw {
     assert(!finished_ && !read_started_ &&
            "WaitForInitialMetadata() is only legal before the first Read()");
     if (lame_status_.has_value() || !completion_) return;
-    completion_->WaitForInitialMetadata();
+    if (completion_->WaitForInitialMetadata() && context_ != nullptr) {
+      context_->egrpc_initial_metadata_received_ = true;
+    }
     EnsureInitialMetadataDeposited();
   }
 
@@ -208,6 +211,9 @@ class ClientStreamRawImpl final : public ClientStreamRaw {
       // whatever terminal status the wire produced.
       context_->egrpc_status_is_local_ =
           local_error_override_.has_value() || r.origin == egrpc::internal::StatusOrigin::kLocal;
+      if (completion_->initial_metadata_received()) {
+        context_->egrpc_initial_metadata_received_ = true;
+      }
       if (!initial_metadata_deposited_) {
         DepositMetadata(r.initial_metadata, &context_->recv_initial_metadata_,
                         &context_->recv_initial_view_);
@@ -224,6 +230,7 @@ class ClientStreamRawImpl final : public ClientStreamRaw {
  private:
   void EnsureInitialMetadataDeposited() {
     if (initial_metadata_deposited_ || context_ == nullptr || !completion_) return;
+    if (completion_->initial_metadata_received()) context_->egrpc_initial_metadata_received_ = true;
     DepositMetadata(completion_->InitialMetadataCopy(), &context_->recv_initial_metadata_,
                     &context_->recv_initial_view_);
     initial_metadata_deposited_ = true;
@@ -295,6 +302,7 @@ Status Channel::BlockingUnaryCallShim(const internal::RpcMethod& method, ClientC
   const egrpc::internal::CallCompletion::Result& result = completion->Wait();
   context->UnbindCancel();
   context->egrpc_status_is_local_ = (result.origin == egrpc::internal::StatusOrigin::kLocal);
+  if (completion->initial_metadata_received()) context->egrpc_initial_metadata_received_ = true;
 
   DepositMetadata(result.initial_metadata, &context->recv_initial_metadata_,
                   &context->recv_initial_view_);
@@ -355,6 +363,14 @@ Status BlockingUnaryCallRaw(ChannelInterface* channel, const RpcMethod& method,
     return Status(StatusCode::INTERNAL, "channel was not created by egrpc's grpc::CreateChannel");
   }
   return egrpc_channel->BlockingUnaryCallShim(method, context, request, response);
+}
+
+std::unique_ptr<ClientStreamRaw> MakeClientStreamRawForCompletion(
+    ClientContext* context, std::shared_ptr<egrpc::internal::CallCompletion> completion,
+    uint32_t max_receive_message_size) {
+  return std::make_unique<ClientStreamRawImpl>(context,
+                                               std::weak_ptr<egrpc::internal::ChannelImpl>(), 0,
+                                               std::move(completion), max_receive_message_size);
 }
 
 std::unique_ptr<ClientStreamRaw> StartServerStreamRaw(ChannelInterface* channel,

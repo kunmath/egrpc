@@ -4,11 +4,12 @@
 // replace, and bounded clean shutdown.
 #include "core/channel_impl.h"
 
+#include <egrpc/log.h>
 #include <poll.h>
 
 #include <algorithm>
 #include <climits>
-#include <cstdio>
+#include <string>
 #include <utility>
 
 namespace egrpc {
@@ -62,6 +63,16 @@ milliseconds DoubleKeepaliveTime(milliseconds t) {
 }
 
 // Remaining whole milliseconds until `deadline` (0 if already passed).
+// now + d, saturating at time_point::max() instead of overflowing.
+steady_clock::time_point SaturatingDeadline(steady_clock::time_point now, milliseconds d) {
+  if (d <= milliseconds(0)) return now;
+  const auto headroom = steady_clock::time_point::max() - now;
+  if (std::chrono::duration_cast<milliseconds>(headroom) <= d) {
+    return steady_clock::time_point::max();
+  }
+  return now + d;
+}
+
 int RemainingMs(steady_clock::time_point deadline) {
   const auto now = steady_clock::now();
   if (deadline <= now) return 0;
@@ -101,6 +112,7 @@ ChannelImpl::ChannelImpl(std::string host, uint16_t port, TlsConfig tls, Channel
           ComputeStreamWindow(effective_max_receive_message_size_, options_.stream_window_slack)),
       effective_max_queued_bytes_(options_.max_queued_bytes == 0 ? stream_window_
                                                                  : options_.max_queued_bytes),
+      loop_(EventThread::Options{options_.event_thread_stack_size}),
       backoff_(MakeBackoffOptions(options_)),
       resolver_(options_.resolve_fn),
       effective_keepalive_time_(options_.http2.keepalive_time) {
@@ -254,7 +266,7 @@ void ChannelImpl::Shutdown() {
   shutdown_done_ = true;
 
   // The total budget starts now, not when DoShutdown() finally runs.
-  const auto deadline = steady_clock::now() + std::max(options_.shutdown_timeout, milliseconds(0));
+  const auto deadline = SaturatingDeadline(steady_clock::now(), options_.shutdown_timeout);
   shutdown_deadline_ns_.store(static_cast<int64_t>(deadline.time_since_epoch().count()),
                               std::memory_order_release);
 
@@ -596,11 +608,11 @@ void ChannelImpl::StartSession() {
       effective_keepalive_time_ = DoubleKeepaliveTime(old_time);
       effective_keepalive_time_ms_.store(effective_keepalive_time_.count(),
                                          std::memory_order_relaxed);
-      std::fprintf(stderr,
-                   "egrpc: WARN: received GOAWAY(ENHANCE_YOUR_CALM/too_many_pings); doubling "
-                   "keepalive_time from %lld ms to %lld ms\n",
-                   static_cast<long long>(old_time.count()),
-                   static_cast<long long>(effective_keepalive_time_.count()));
+      egrpc::Log(egrpc::LogLevel::kWarn, "keepalive",
+                 "received GOAWAY(ENHANCE_YOUR_CALM/too_many_pings); doubling keepalive_time "
+                 "from " +
+                     std::to_string(old_time.count()) + " ms to " +
+                     std::to_string(effective_keepalive_time_.count()) + " ms");
     }
     pending_goaway_process_ = true;
   };
@@ -1192,7 +1204,7 @@ void ChannelImpl::DoShutdown() {
   const int64_t deadline_ticks = shutdown_deadline_ns_.load(std::memory_order_acquire);
   const auto shutdown_deadline =
       deadline_ticks != 0 ? steady_clock::time_point(steady_clock::duration(deadline_ticks))
-                          : steady_clock::now() + budget;
+                          : SaturatingDeadline(steady_clock::now(), budget);
 
   // §5.7: unblock every waiter first, before any socket/DNS teardown.
   FailActiveCalls(kShutDownMessage);
@@ -1216,7 +1228,8 @@ void ChannelImpl::DoShutdown() {
   if (can_send_goaway) {
     // Graceful close: GOAWAY(NO_ERROR) + flush bounded by a short sub-budget
     // (best-effort; no waiting for the peer).
-    const auto close_deadline = std::min(shutdown_deadline, steady_clock::now() + sub_budget);
+    const auto close_deadline =
+        std::min(shutdown_deadline, SaturatingDeadline(steady_clock::now(), sub_budget));
     h2_->Terminate();
     for (;;) {
       // Checked every iteration (also after kOk writes) so a peer that keeps

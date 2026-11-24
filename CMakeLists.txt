@@ -57,6 +57,8 @@ set(EGRPC_SOURCES
   src/core/backoff.cc
   src/api/channel.cc
   src/api/create_channel.cc
+  src/api/log.cc
+  src/api/channel_config.cc
 )
 
 # ---------------------------------------------------------------------------
@@ -118,6 +120,7 @@ option(EGRPC_BUILD_EXAMPLES "Build examples (M4 shim acceptance)" ${_egrpc_is_to
 
 if(EGRPC_BUILD_EXAMPLES)
   add_subdirectory(examples/route_guide)
+  add_subdirectory(examples/resilient_subscribe)
 endif()
 
 # ---------------------------------------------------------------------------

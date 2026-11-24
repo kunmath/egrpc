@@ -82,6 +82,9 @@ class ClientContext {
   // (TryCancel, local deadline, transport teardown, shutdown) rather than
   // from the server (trailers grpc-status, HTTP status, server RST_STREAM).
   bool egrpc_status_is_local() const { return egrpc_status_is_local_; }
+  // egrpc extension: true once valid gRPC initial metadata (:status 200,
+  // application/grpc content-type) was received for this call.
+  bool egrpc_initial_metadata_received() const { return egrpc_initial_metadata_received_; }
 
  private:
   // grpc::Channel and ClientStreamRawImpl are the shim's call drivers: they
@@ -108,6 +111,7 @@ class ClientContext {
   std::chrono::system_clock::time_point deadline_ = std::chrono::system_clock::time_point::max();
   bool wait_for_ready_ = false;
   bool egrpc_status_is_local_ = false;
+  bool egrpc_initial_metadata_received_ = false;
   std::multimap<std::string, std::string> send_initial_metadata_;
 
   // Received metadata storage + views into it. multimap nodes are stable,
@@ -132,6 +136,14 @@ class ClientContextAccess {
  public:
   static void MarkStatusLocal(ClientContext* context) {
     if (context != nullptr) context->egrpc_status_is_local_ = true;
+  }
+  static void MarkInitialMetadataReceived(ClientContext* context) {
+    if (context != nullptr) context->egrpc_initial_metadata_received_ = true;
+  }
+  // Test seam: binds a TryCancel() hook so fake readers can observe
+  // cancellation. Returns true if TryCancel() was already requested.
+  static bool BindCancel(ClientContext* context, std::function<void()> fn) {
+    return context != nullptr && context->BindCancel(std::move(fn));
   }
 };
 

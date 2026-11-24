@@ -14,6 +14,8 @@
 #include <memory>
 #include <string>
 
+#include "api/client_stream_raw_internal.h"
+#include "core/call_state.h"
 #include "core/channel_impl.h"
 #include "doctest/doctest.h"
 #include "grpcpp/channel.h"
@@ -70,6 +72,31 @@ TEST_SUITE("shim_args") {
     ctx.set_wait_for_ready(true);
     ctx.TryCancel();
     CHECK_FALSE(ctx.egrpc_status_is_local());
+  }
+
+  TEST_CASE("ClientContext egrpc_initial_metadata_received defaults to false and is markable") {
+    grpc::ClientContext ctx;
+    CHECK_FALSE(ctx.egrpc_initial_metadata_received());
+    grpc::internal::ClientContextAccess::MarkInitialMetadataReceived(nullptr);
+    grpc::internal::ClientContextAccess::MarkInitialMetadataReceived(&ctx);
+    CHECK(ctx.egrpc_initial_metadata_received());
+  }
+
+  TEST_CASE("Finish() without WaitForInitialMetadata marks valid initial metadata arrival") {
+    auto completion = std::make_shared<egrpc::internal::CallCompletion>();
+    egrpc::internal::CallState call(4 * 1024 * 1024, egrpc::internal::CallMode::kServerStreaming,
+                                    completion, 16, 4 * 1024 * 1024);
+    call.OnResponseHeaders({{":status", "200"}, {"content-type", "application/grpc"}},
+                           /*end_stream=*/false);
+    call.OnTrailers({{"grpc-status", "0"}});
+    call.OnClose(0);
+
+    grpc::ClientContext ctx;
+    std::unique_ptr<grpc::internal::ClientStreamRaw> raw =
+        grpc::internal::MakeClientStreamRawForCompletion(&ctx, completion, 4 * 1024 * 1024);
+    const grpc::Status s = raw->Finish();
+    CHECK(s.ok());
+    CHECK(ctx.egrpc_initial_metadata_received());
   }
 
   TEST_CASE("ChannelArguments M6 keys use upstream channel-arg names") {
@@ -154,6 +181,7 @@ TEST_SUITE("shim_args") {
         grpc::internal::StartServerStreamRaw(channel.get(), kStreamMethod, &ctx, "request-bytes");
     REQUIRE(raw != nullptr);
     raw->WaitForInitialMetadata();  // must not block on a never-started call
+    CHECK_FALSE(ctx.egrpc_initial_metadata_received());
 
     std::string msg = "untouched";
     CHECK_FALSE(raw->ReadRaw(&msg));

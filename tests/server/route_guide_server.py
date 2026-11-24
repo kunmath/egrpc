@@ -29,11 +29,24 @@ _PROTO_DIR = os.path.join(_REPO_ROOT, "examples", "route_guide")
 _PROTO_FILE = os.path.join(_PROTO_DIR, "route_guide.proto")
 
 
+_STUBS_CACHE = None
+_STUBS_LOCK = threading.Lock()
+
+
 def _generate_stubs():
     """Generate route_guide_pb2 / _pb2_grpc into a tempdir and import them.
 
-    Returns a tuple ``(pb2, pb2_grpc)`` of the freshly imported modules.
+    Returns a tuple ``(pb2, pb2_grpc)``. Cached per process so fast server
+    restarts do not re-run grpc_tools.protoc.
     """
+    global _STUBS_CACHE
+    with _STUBS_LOCK:
+        if _STUBS_CACHE is None:
+            _STUBS_CACHE = _generate_stubs_uncached()
+        return _STUBS_CACHE
+
+
+def _generate_stubs_uncached():
     out_dir = tempfile.mkdtemp(prefix="egrpc_rg_stubs_")
 
     # grpc_tools bundles the well-known-type .proto files; include their path so
@@ -64,12 +77,31 @@ class RouteGuideTestServer:
     Args:
         certfile: path to the server certificate (PEM).
         keyfile: path to the server private key (PEM).
+        port: port to bind on 127.0.0.1 (0 = ephemeral). Binding retries
+            briefly so a restart can reuse the previous instance's port.
+        root_ca_file: when set, require client certificates signed by this
+            CA (mTLS).
+        server_generation: instance number reported by ListFeatures mode 7
+            (initial metadata "egrpc-gen" and Feature.location.longitude).
     """
 
-    def __init__(self, certfile, keyfile, max_concurrent_streams=None):
+    def __init__(
+        self,
+        certfile,
+        keyfile,
+        max_concurrent_streams=None,
+        port=0,
+        root_ca_file=None,
+        server_generation=0,
+    ):
         self._certfile = certfile
         self._keyfile = keyfile
         self._max_concurrent_streams = max_concurrent_streams
+        self._requested_port = port
+        self._root_ca_file = root_ca_file
+        self.server_generation = server_generation
+        self._attempt_lock = threading.Lock()
+        self._attempts = {}
         self._server = None
         self.port = None
         self._pb2 = None
@@ -90,6 +122,13 @@ class RouteGuideTestServer:
 
     def wait_for_cancellation(self, timeout=5.0):
         return self._cancel_event.wait(timeout=timeout)
+
+    def _next_attempt(self, mode):
+        """Returns the 1-based attempt number of a ListFeatures call in mode."""
+        with self._attempt_lock:
+            n = self._attempts.get(mode, 0) + 1
+            self._attempts[mode] = n
+            return n
 
     def _record_cancellation(self):
         with self._cancel_lock:
@@ -295,6 +334,77 @@ class RouteGuideTestServer:
                             break
                     return
 
+                # Mode 7: sequenced subscribe stream resuming after cursor
+                # lo.longitude, up to hi.latitude (default 10000), one message
+                # every hi.longitude ms (default 25).
+                if mode == 7:
+                    cancelled = threading.Event()
+
+                    def _on_done():
+                        if not context.is_active():
+                            cancelled.set()
+
+                    context.add_callback(_on_done)
+                    gen = server_obj.server_generation
+                    cursor = max(0, request.lo.longitude)
+                    max_seq = request.hi.latitude if request.hi.latitude > 0 else 10000
+                    delay_ms = request.hi.longitude if request.hi.longitude > 0 else 25
+                    context.send_initial_metadata((("egrpc-gen", str(gen)),))
+                    for seq in range(cursor + 1, max_seq + 1):
+                        if not context.is_active():
+                            return
+                        yield pb2.Feature(
+                            name="notif-{}".format(seq),
+                            location=pb2.Point(latitude=seq, longitude=gen),
+                        )
+                        if cancelled.wait(delay_ms / 1000.0):
+                            return
+                    return
+
+                # Mode 8: the first lo.longitude attempts abort with a
+                # server-originated CANCELLED (no initial metadata); later
+                # attempts stream hi.latitude (default 3) sequenced events.
+                if mode == 8:
+                    attempt = server_obj._next_attempt(8)
+                    if attempt <= request.lo.longitude:
+                        context.abort(grpc.StatusCode.CANCELLED, "server-bounced")
+                        return
+                    context.send_initial_metadata((("egrpc-attempt", str(attempt)),))
+                    count = request.hi.latitude if request.hi.latitude > 0 else 3
+                    for seq in range(1, count + 1):
+                        yield pb2.Feature(
+                            name="notif-{}".format(seq),
+                            location=pb2.Point(latitude=seq, longitude=0),
+                        )
+                    return
+
+                # Mode 9: attempt 1 stalls without initial metadata until the
+                # client cancels / times out; later attempts stream
+                # hi.latitude (default 3) sequenced events.
+                if mode == 9:
+                    attempt = server_obj._next_attempt(9)
+                    if attempt == 1:
+                        cancelled = threading.Event()
+
+                        def _on_done():
+                            if not context.is_active():
+                                cancelled.set()
+
+                        context.add_callback(_on_done)
+                        deadline = time.monotonic() + 30.0
+                        while time.monotonic() < deadline and context.is_active():
+                            if cancelled.wait(0.02):
+                                break
+                        return
+                    context.send_initial_metadata((("egrpc-attempt", str(attempt)),))
+                    count = request.hi.latitude if request.hi.latitude > 0 else 3
+                    for seq in range(1, count + 1):
+                        yield pb2.Feature(
+                            name="notif-{}".format(seq),
+                            location=pb2.Point(latitude=seq, longitude=0),
+                        )
+                    return
+
                 context.abort(
                     grpc.StatusCode.INVALID_ARGUMENT,
                     "unknown ListFeatures mode {}".format(mode),
@@ -321,16 +431,35 @@ class RouteGuideTestServer:
             key = fh.read()
         with open(self._certfile, "rb") as fh:
             cert = fh.read()
-        creds = grpc.ssl_server_credentials(((key, cert),))
-        self.port = self._server.add_secure_port("127.0.0.1:0", creds)
+        if self._root_ca_file is not None:
+            with open(self._root_ca_file, "rb") as fh:
+                root_ca = fh.read()
+            creds = grpc.ssl_server_credentials(
+                ((key, cert),), root_certificates=root_ca, require_client_auth=True
+            )
+        else:
+            creds = grpc.ssl_server_credentials(((key, cert),))
+        addr = "127.0.0.1:{}".format(self._requested_port)
+        # A fixed port may still be held briefly by a just-stopped instance.
+        deadline = time.monotonic() + 10.0
+        while True:
+            try:
+                self.port = self._server.add_secure_port(addr, creds)
+            except RuntimeError:
+                self.port = 0
+            if self.port != 0 or self._requested_port == 0:
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
         if self.port == 0:
-            raise RuntimeError("add_secure_port failed to bind 127.0.0.1:0")
+            raise RuntimeError("add_secure_port failed to bind {}".format(addr))
         self._server.start()
         return self
 
-    def stop(self):
+    def stop(self, grace=1.0):
         if self._server is not None:
-            self._server.stop(grace=1.0).wait(timeout=5.0)
+            self._server.stop(grace=grace).wait(timeout=5.0)
             self._server = None
 
     def __enter__(self):

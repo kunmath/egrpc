@@ -82,6 +82,8 @@ struct ChannelOptions {
   // Prepended to the built-in user-agent (§5.1); upstream's
   // GRPC_ARG_PRIMARY_USER_AGENT maps here.
   std::string user_agent_prefix;
+  // EventThread stack size (§3); 0 = platform default.
+  size_t event_thread_stack_size = 128 * 1024;
 };
 
 class ChannelImpl {
