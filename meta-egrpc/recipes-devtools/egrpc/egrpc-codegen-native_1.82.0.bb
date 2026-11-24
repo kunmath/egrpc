@@ -51,7 +51,7 @@ do_compile() {
     cmake --install ${WORKDIR}/build-abseil
 
     cmake -S ${WORKDIR}/protobuf-${PROTOBUF_VERSION} -B ${WORKDIR}/build-protobuf $common \
-        -Dprotobuf_BUILD_TESTS=OFF -Dprotobuf_BUILD_SHARED_LIBS=OFF \
+        -Dprotobuf_BUILD_TESTS=OFF -Dprotobuf_BUILD_SHARED_LIBS=OFF -Dprotobuf_WITH_ZLIB=OFF \
         -Dprotobuf_LOCAL_DEPENDENCIES_ONLY=ON -Dprotobuf_ABSL_PROVIDER=package
     cmake --build ${WORKDIR}/build-protobuf ${PARALLEL_MAKE}
     cmake --install ${WORKDIR}/build-protobuf
