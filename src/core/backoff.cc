@@ -27,7 +27,8 @@ uint64_t SplitMix64(uint64_t x) {
 
 }  // namespace
 
-Backoff::Backoff(BackoffOptions options) : Backoff(options, MakeSeed(this)) {}
+Backoff::Backoff(BackoffOptions options)
+    : Backoff(options, MakeSeed(reinterpret_cast<uintptr_t>(this))) {}
 
 Backoff::Backoff(BackoffOptions options, uint64_t seed) : options_(Sanitize(options)), rng_(seed) {
   Reset();
@@ -45,7 +46,7 @@ BackoffOptions Backoff::Sanitize(BackoffOptions o) {
   return o;
 }
 
-uint64_t Backoff::MakeSeed(const void* salt) {
+uint64_t Backoff::MakeSeed(uintptr_t salt) {
   uint64_t seed = 0;
   try {
     std::random_device rd;
@@ -55,7 +56,7 @@ uint64_t Backoff::MakeSeed(const void* salt) {
   }
   seed ^= SplitMix64(
       static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()));
-  seed ^= SplitMix64(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(salt)));
+  seed ^= SplitMix64(static_cast<uint64_t>(salt));
   return SplitMix64(seed);
 }
 

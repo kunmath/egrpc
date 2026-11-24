@@ -54,7 +54,7 @@ class Backoff {
 
  private:
   static BackoffOptions Sanitize(BackoffOptions options);
-  static uint64_t MakeSeed(const void* salt);
+  static uint64_t MakeSeed(uintptr_t salt);
   bool IsStable(TimePoint now) const;
 
   BackoffOptions options_;
