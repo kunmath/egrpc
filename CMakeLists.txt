@@ -114,6 +114,7 @@ if(EGRPC_BUILD_TESTS)
   include(CTest)
   add_subdirectory(tests/unit)
   add_subdirectory(tests/integration)
+  add_subdirectory(tests/interop)
 endif()
 
 option(EGRPC_BUILD_EXAMPLES "Build examples (M4 shim acceptance)" ${_egrpc_is_top})
