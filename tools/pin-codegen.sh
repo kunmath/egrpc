@@ -17,18 +17,18 @@
 # repository-root .gitignore.
 #
 # Pinned versions and checksums (see docs/codegen-pinning.md):
-#   gRPC          v1.82.0       source tarball
-#     https://github.com/grpc/grpc/archive/refs/tags/v1.82.0.tar.gz
-#     sha256 d6851f59b9c4edb3218d2659a3abf1138e5bb4d2871c9e89c9330ed71756ed0b
-#     (extracts to grpc-1.82.0/)
-#   protoc        35.0          official prebuilt (linux-x86_64)
-#     https://github.com/protocolbuffers/protobuf/releases/download/v35.0/protoc-35.0-linux-x86_64.zip
-#     sha256 a45cda0989c17dd950db55f6fbe1e5814c50fda08e87aa422980ac1f89dddbbc
-#   protobuf      35.0          source (libprotoc, to build the plugin)
-#     https://github.com/protocolbuffers/protobuf/releases/download/v35.0/protobuf-35.0.tar.gz
-#     sha256 8f907baca4b34a3b4854103ba5811e418fb6e2ff11fe0d8df9e8280b11d79926
-#     (extracts to protobuf-35.0/; does NOT bundle Abseil)
-#   abseil-cpp    20250512.1    source (the version protobuf 35.0 pins)
+#   gRPC          v1.85.4       source tarball
+#     https://github.com/grpc/grpc/archive/refs/tags/v1.85.4.tar.gz
+#     sha256 e2382869a2837e2e4f9d5ad291ae8e4b256d44def4d6839c2930a9f7b433249a
+#     (extracts to grpc-1.85.4/)
+#   protoc        35.1          official prebuilt (linux-x86_64)
+#     https://github.com/protocolbuffers/protobuf/releases/download/v35.1/protoc-35.1-linux-x86_64.zip
+#     sha256 6930ebf62bd4ea607b98fff052596c6ee564b9835b4ce172c75a3f53ae9d91b7
+#   protobuf      35.1          source (libprotoc, to build the plugin)
+#     https://github.com/protocolbuffers/protobuf/releases/download/v35.1/protobuf-35.1.tar.gz
+#     sha256 f0b6838e7522a8da96126d487068c959bc624926368f3024ac8fd03abd0a1ac4
+#     (extracts to protobuf-35.1/; does NOT bundle Abseil)
+#   abseil-cpp    20250512.1    source (the version protobuf 35.1 pins)
 #     https://github.com/abseil/abseil-cpp/releases/download/20250512.1/abseil-cpp-20250512.1.tar.gz
 #     sha256 9b7a064305e9fd94d124ffa6cc358592eb42b5da588fb4e07d09254aa40086db
 #
@@ -37,19 +37,19 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Pinned versions & checksums
 # ---------------------------------------------------------------------------
-GRPC_VERSION="1.82.0"
-PROTOC_VERSION="35.0"
-PROTOBUF_VERSION="35.0"
+GRPC_VERSION="1.85.4"
+PROTOC_VERSION="35.1"
+PROTOBUF_VERSION="35.1"
 ABSEIL_VERSION="20250512.1"
 
 GRPC_URL="https://github.com/grpc/grpc/archive/refs/tags/v${GRPC_VERSION}.tar.gz"
-GRPC_SHA256="d6851f59b9c4edb3218d2659a3abf1138e5bb4d2871c9e89c9330ed71756ed0b"
+GRPC_SHA256="e2382869a2837e2e4f9d5ad291ae8e4b256d44def4d6839c2930a9f7b433249a"
 
 PROTOC_ZIP_URL="https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
-PROTOC_ZIP_SHA256="a45cda0989c17dd950db55f6fbe1e5814c50fda08e87aa422980ac1f89dddbbc"
+PROTOC_ZIP_SHA256="6930ebf62bd4ea607b98fff052596c6ee564b9835b4ce172c75a3f53ae9d91b7"
 
 PROTOBUF_SRC_URL="https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOBUF_VERSION}/protobuf-${PROTOBUF_VERSION}.tar.gz"
-PROTOBUF_SRC_SHA256="8f907baca4b34a3b4854103ba5811e418fb6e2ff11fe0d8df9e8280b11d79926"
+PROTOBUF_SRC_SHA256="f0b6838e7522a8da96126d487068c959bc624926368f3024ac8fd03abd0a1ac4"
 
 ABSEIL_URL="https://github.com/abseil/abseil-cpp/releases/download/${ABSEIL_VERSION}/abseil-cpp-${ABSEIL_VERSION}.tar.gz"
 ABSEIL_SHA256="9b7a064305e9fd94d124ffa6cc358592eb42b5da588fb4e07d09254aa40086db"
@@ -224,7 +224,7 @@ build_protobuf() {
   local bld="${WORK_DIR}/build-protobuf"
   rm -rf "$bld"
   # protobuf_LOCAL_DEPENDENCIES_ONLY=ON disables the FetchContent fallback in
-  # protobuf 35.0's cmake/abseil-cpp.cmake, so Abseil can only come from
+  # protobuf 35.1's cmake/abseil-cpp.cmake, so Abseil can only come from
   # find_package against $PREFIX (our pinned build) — that is the whole point
   # of pinning here. protobuf_ABSL_PROVIDER=package is the older spelling of
   # the same intent, kept for belt-and-suspenders.

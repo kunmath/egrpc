@@ -56,9 +56,9 @@ return `UNIMPLEMENTED` at runtime.
 `grpc::internal` is unstable upstream, so **one `grpc_cpp_plugin` version is pinned
 per egrpc release**, verified in CI by regenerating stubs and compiling.
 
-- Pinned for v0.1: **gRPC v1.82.0** (`grpc_cpp_plugin`, built from SHA-256-verified
-  source — upstream publishes no prebuilt plugin binaries) and **protoc 35.0**
-  (official prebuilt binary, SHA-256-verified), the protobuf version gRPC v1.82.0
+- Pinned for v0.1: **gRPC v1.85.4** (`grpc_cpp_plugin`, built from SHA-256-verified
+  source — upstream publishes no prebuilt plugin binaries) and **protoc 35.1**
+  (official prebuilt binary, SHA-256-verified), the protobuf version gRPC v1.85.4
   pins. `tools/pin-codegen.sh` fetches/builds both into `tools/bin/`; versions and
   checksums are recorded in that script and docs/codegen-pinning.md.
 - Never regenerate stubs with an unpinned tool. Shim changes for a new plugin

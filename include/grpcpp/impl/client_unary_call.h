@@ -29,7 +29,7 @@ Status BlockingUnaryCallRaw(ChannelInterface* channel, const RpcMethod& method,
                             ClientContext* context, const std::string& request,
                             std::string* response);
 
-// Matches the four-template-arg form the pinned plugin (gRPC v1.82.0)
+// Matches the four-template-arg form the pinned plugin (gRPC v1.85.4)
 // generates: Base{Input,Output}Message select the SerializationTraits
 // specialization — protobuf::MessageLite for proto services.
 template <class InputMessage, class OutputMessage, class BaseInputMessage = InputMessage,

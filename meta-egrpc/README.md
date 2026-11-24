@@ -5,7 +5,7 @@ Yocto layer for **egrpc**, a client-only gRPC C++ library for embedded Linux.
 ## Supported releases
 
 **scarthgap (5.0 LTS) only.** `kirkstone` is not supported: its protobuf
-(3.19) and GCC 11 differ from what egrpc's pinned `grpc_cpp_plugin` v1.82.0
+(3.19) and GCC 11 differ from what egrpc's pinned `grpc_cpp_plugin` v1.85.4
 stubs and the C++17 shim were verified against, and only one LTS is kept
 under test for v0.1. Verified on scarthgap 5.0.21, `MACHINE = "qemuarm64"`.
 
@@ -24,7 +24,7 @@ bitbake-layers add-layer /path/to/egrpc/meta-egrpc
 | Recipe | Kind | Provides |
 |---|---|---|
 | `egrpc` (`egrpc_git.bb`) | target | `libegrpc.so.0`, `libegrpc.a`, headers, `egrpc.pc` |
-| `egrpc-codegen-native` (`egrpc-codegen-native_1.82.0.bb`) | host only | `${bindir}/egrpc-grpc_cpp_plugin` (pinned gRPC v1.82.0) |
+| `egrpc-codegen-native` (`egrpc-codegen-native_1.85.4.bb`) | host only | `${bindir}/egrpc-grpc_cpp_plugin` (pinned gRPC v1.85.4) |
 
 ```
 bitbake egrpc

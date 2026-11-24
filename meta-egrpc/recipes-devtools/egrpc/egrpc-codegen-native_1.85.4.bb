@@ -1,27 +1,27 @@
-SUMMARY = "Pinned host-side gRPC v1.82.0 grpc_cpp_plugin for egrpc"
-DESCRIPTION = "Builds ONLY grpc_cpp_plugin from SHA-256-verified gRPC v1.82.0 \
-sources against a static protobuf 35.0 libprotoc and static Abseil \
+SUMMARY = "Pinned host-side gRPC v1.85.4 grpc_cpp_plugin for egrpc"
+DESCRIPTION = "Builds ONLY grpc_cpp_plugin from SHA-256-verified gRPC v1.85.4 \
+sources against a static protobuf 35.1 libprotoc and static Abseil \
 20250512.1, mirroring egrpc's tools/pin-codegen.sh. The gRPC runtime is never \
 built. Host-only (-native): codegen tools are never cross-compiled to target. \
 Installed as egrpc-grpc_cpp_plugin to avoid colliding with meta-oe's grpc-native."
 HOMEPAGE = "https://github.com/grpc/grpc"
 LICENSE = "Apache-2.0 & BSD-3-Clause"
 LIC_FILES_CHKSUM = " \
-    file://${WORKDIR}/grpc-1.82.0/LICENSE;md5=fe8c552b7748e45c00ac55ac0257f6c9 \
-    file://${WORKDIR}/protobuf-35.0/LICENSE;md5=37b5762e07f0af8c74ce80a8bda4266b \
+    file://${WORKDIR}/grpc-1.85.4/LICENSE;md5=fe8c552b7748e45c00ac55ac0257f6c9 \
+    file://${WORKDIR}/protobuf-35.1/LICENSE;md5=37b5762e07f0af8c74ce80a8bda4266b \
     file://${WORKDIR}/abseil-cpp-20250512.1/LICENSE;md5=df52c6edb7adc22e533b2bacc3bd3915 \
 "
 
 ABSEIL_VERSION = "20250512.1"
-PROTOBUF_VERSION = "35.0"
+PROTOBUF_VERSION = "35.1"
 
 SRC_URI = " \
     https://github.com/grpc/grpc/archive/refs/tags/v${PV}.tar.gz;downloadfilename=grpc-${PV}.tar.gz;name=grpc;unpack=1 \
     https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOBUF_VERSION}/protobuf-${PROTOBUF_VERSION}.tar.gz;name=protobuf;unpack=1 \
     https://github.com/abseil/abseil-cpp/releases/download/${ABSEIL_VERSION}/abseil-cpp-${ABSEIL_VERSION}.tar.gz;name=abseil;unpack=1 \
 "
-SRC_URI[grpc.sha256sum] = "d6851f59b9c4edb3218d2659a3abf1138e5bb4d2871c9e89c9330ed71756ed0b"
-SRC_URI[protobuf.sha256sum] = "8f907baca4b34a3b4854103ba5811e418fb6e2ff11fe0d8df9e8280b11d79926"
+SRC_URI[grpc.sha256sum] = "e2382869a2837e2e4f9d5ad291ae8e4b256d44def4d6839c2930a9f7b433249a"
+SRC_URI[protobuf.sha256sum] = "f0b6838e7522a8da96126d487068c959bc624926368f3024ac8fd03abd0a1ac4"
 SRC_URI[abseil.sha256sum] = "9b7a064305e9fd94d124ffa6cc358592eb42b5da588fb4e07d09254aa40086db"
 
 # The archives are pinned by SHA-256 (identical to tools/pin-codegen.sh), so

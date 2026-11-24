@@ -24,7 +24,7 @@ PACKAGECONFIG[examples] = "-DEGRPC_BUILD_EXAMPLES=ON,-DEGRPC_BUILD_EXAMPLES=OFF,
 
 # Regenerate the example stubs in-recipe instead of using the checked-in
 # desktop copies: .pb.* with protobuf-native's protoc (must match the target
-# protobuf runtime), .grpc.pb.* with the pinned egrpc-grpc_cpp_plugin v1.82.0.
+# protobuf runtime), .grpc.pb.* with the pinned egrpc-grpc_cpp_plugin v1.85.4.
 do_configure:prepend() {
     if ${@bb.utils.contains('PACKAGECONFIG', 'examples', 'true', 'false', d)}; then
         gen=${S}/examples/route_guide/gen

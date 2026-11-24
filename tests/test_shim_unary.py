@@ -1,7 +1,7 @@
 """M4 acceptance (design §8): unary calls through UNMODIFIED generated stubs.
 
 Ring-2/3 interop: the vendored route_guide example client — built from
-grpc_cpp_plugin v1.82.0 output compiled against egrpc's grpcpp shim — runs
+grpc_cpp_plugin v1.85.4 output compiled against egrpc's grpcpp shim — runs
 GetFeature against a real upstream-grpcio TLS server. This exercises the
 whole shim funnel (CreateChannel → NewStub → BlockingUnaryCall →
 SerializationTraits) rather than the M3 byte-level probe.

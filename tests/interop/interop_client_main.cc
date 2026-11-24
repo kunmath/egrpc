@@ -1,5 +1,5 @@
 // egrpc M8 acceptance (design §8): the in-scope subset of the upstream gRPC
-// interop test client, built against UNMODIFIED grpc_cpp_plugin v1.82.0 stubs
+// interop test client, built against UNMODIFIED grpc_cpp_plugin v1.85.4 stubs
 // for grpc.testing.TestService (gen/src/proto/grpc/testing/test.grpc.pb.*) with
 // egrpc's grpcpp shim underneath. See docs/interop.md.
 //

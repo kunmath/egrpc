@@ -1,7 +1,7 @@
 # egrpc M8 interop subset (design §8): an upstream-style interop client built
 # against the vendored gRPC v1.82.0 testing protos. The .pb.{h,cc} come from
 # protoc 21.12 (matching the host libprotobuf-lite); test.grpc.pb.{h,cc} are the
-# UNMODIFIED output of the pinned grpc_cpp_plugin v1.82.0.
+# UNMODIFIED output of the pinned grpc_cpp_plugin v1.85.4.
 add_library(interop_proto STATIC
   gen/src/proto/grpc/testing/empty.pb.cc
   gen/src/proto/grpc/testing/messages.pb.cc

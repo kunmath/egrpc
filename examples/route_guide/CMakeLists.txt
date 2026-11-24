@@ -1,5 +1,5 @@
 # egrpc M4 acceptance example (design §8): the vendored route_guide client
-# built against the checked-in, UNMODIFIED grpc_cpp_plugin v1.82.0 stubs in
+# built against the checked-in, UNMODIFIED grpc_cpp_plugin v1.85.4 stubs in
 # gen/. Compiling gen/route_guide.grpc.pb.cc against the grpcpp shim is the
 # milestone's compile-level acceptance check.
 add_executable(egrpc_route_guide_client

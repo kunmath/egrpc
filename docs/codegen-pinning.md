@@ -6,29 +6,29 @@ is frozen per egrpc release and verified in CI (design §4.5). `tools/pin-codege
 installs these host tools into `tools/bin/`; nothing here is cross-compiled to the
 target (design §4, item 5 — codegen tools are host-side only).
 
-## Pinned versions (v0.1 — gRPC v1.82.0)
+## Pinned versions (v0.1 — gRPC v1.85.4)
 
 | Component | Version | Kind | URL | SHA-256 |
 |-----------|---------|------|-----|---------|
-| gRPC | v1.82.0 | source tarball (extracts to `grpc-1.82.0/`) | https://github.com/grpc/grpc/archive/refs/tags/v1.82.0.tar.gz | `d6851f59b9c4edb3218d2659a3abf1138e5bb4d2871c9e89c9330ed71756ed0b` |
-| protoc | 35.0 | official prebuilt (linux-x86_64) | https://github.com/protocolbuffers/protobuf/releases/download/v35.0/protoc-35.0-linux-x86_64.zip | `a45cda0989c17dd950db55f6fbe1e5814c50fda08e87aa422980ac1f89dddbbc` |
-| protobuf | 35.0 | source (libprotoc, to build the plugin; extracts to `protobuf-35.0/`, does **not** bundle Abseil) | https://github.com/protocolbuffers/protobuf/releases/download/v35.0/protobuf-35.0.tar.gz | `8f907baca4b34a3b4854103ba5811e418fb6e2ff11fe0d8df9e8280b11d79926` |
-| abseil-cpp | 20250512.1 | source (the version protobuf 35.0 pins in its `MODULE.bazel`) | https://github.com/abseil/abseil-cpp/releases/download/20250512.1/abseil-cpp-20250512.1.tar.gz | `9b7a064305e9fd94d124ffa6cc358592eb42b5da588fb4e07d09254aa40086db` |
+| gRPC | v1.85.4 | source tarball (extracts to `grpc-1.85.4/`) | https://github.com/grpc/grpc/archive/refs/tags/v1.85.4.tar.gz | `e2382869a2837e2e4f9d5ad291ae8e4b256d44def4d6839c2930a9f7b433249a` |
+| protoc | 35.1 | official prebuilt (linux-x86_64) | https://github.com/protocolbuffers/protobuf/releases/download/v35.1/protoc-35.1-linux-x86_64.zip | `6930ebf62bd4ea607b98fff052596c6ee564b9835b4ce172c75a3f53ae9d91b7` |
+| protobuf | 35.1 | source (libprotoc, to build the plugin; extracts to `protobuf-35.1/`, does **not** bundle Abseil) | https://github.com/protocolbuffers/protobuf/releases/download/v35.1/protobuf-35.1.tar.gz | `f0b6838e7522a8da96126d487068c959bc624926368f3024ac8fd03abd0a1ac4` |
+| abseil-cpp | 20250512.1 | source (the version protobuf 35.1 pins in its `MODULE.bazel`) | https://github.com/abseil/abseil-cpp/releases/download/20250512.1/abseil-cpp-20250512.1.tar.gz | `9b7a064305e9fd94d124ffa6cc358592eb42b5da588fb4e07d09254aa40086db` |
 
-protoc 35.0 is the protobuf version that gRPC v1.82.0 pins. Every download is
+protoc 35.1 is the protobuf version that gRPC v1.85.4 pins. Every download is
 verified against its SHA-256 **before use**; a mismatch is a hard failure.
 
 ## Why the plugin is compiled from source
 
 Upstream gRPC publishes **no prebuilt `grpc_cpp_plugin` binaries** — there are no
-release assets for the plugin on `grpc/grpc` (verified on v1.82.0) and nothing on
+release assets for the plugin on `grpc/grpc` (verified on v1.85.4) and nothing on
 Maven Central. `protoc` itself ships an official prebuilt binary, but the plugin
 does not. So `pin-codegen.sh`:
 
 1. Installs the prebuilt `protoc` from the verified zip (plus its bundled
    well-known-type `.proto` files into `tools/include/`).
 2. Builds **Abseil** (static, PIC) from the pinned tarball into a private prefix.
-3. Builds **protobuf 35.0** (static `libprotoc`/`libprotobuf`) against that Abseil,
+3. Builds **protobuf 35.1** (static `libprotoc`/`libprotobuf`) against that Abseil,
    with `protobuf_LOCAL_DEPENDENCIES_ONLY=ON` so protobuf's CMake resolves its
    dependency on the pinned Abseil rather than silently `FetchContent`-ing an
    unpinned copy.
@@ -50,7 +50,7 @@ The pin above freezes the **`grpc_cpp_plugin` stub contract** (`.grpc.pb.h/.cc`
 ↔ the `grpcpp/` shim). It does **not** govern protobuf *message* codegen
 (`.pb.h/.cc`): protobuf generated code must match the protobuf **runtime** it
 compiles against, and egrpc's runtime is the **system** protobuf-lite (design
-§1 — no vendoring; Yocto provides it). protoc 35.0 output cannot compile
+§1 — no vendoring; Yocto provides it). protoc 35.1 output cannot compile
 against the 3.21.x runtime that current Ubuntu/CI images ship, so using the
 pinned protoc for message codegen is impossible by construction.
 
@@ -109,8 +109,16 @@ and installs it as `egrpc-grpc_cpp_plugin`. With `PACKAGECONFIG:pn-egrpc =
 `route_guide.grpc.pb.*` in one protoc 25.8 invocation; the regenerated
 `.grpc.pb.{h,cc}` are byte-identical to the checked-in v1.82.0 stubs, and
 `egrpc_route_guide_client` compiles and links for aarch64 with zero warnings.
-The pinned protoc 35.0 is therefore **not** needed inside Yocto. (The protoc
+The pinned protoc 35.1 is therefore **not** needed inside Yocto. (The protoc
 21.12 CI driver remains covered by the M4 CI stub-regeneration job.)
+
+Pre-v0.1.0 pin bump (2026-11-25): bumped from gRPC v1.82.0 / protobuf 35.0 to
+gRPC **v1.85.4** / protobuf **35.1** (Abseil stays 20250512.1, matching protobuf
+35.1's `MODULE.bazel`). Upstream `src/compiler/cpp_generator.cc` had no
+generated-code contract changes between v1.82.0 and v1.85.4, and regenerating
+both `examples/route_guide` and `tests/interop` stubs with v1.85.4 produces
+byte-identical `.grpc.pb.{h,cc}` output. The Yocto native recipe was updated
+accordingly to `meta-egrpc/recipes-devtools/egrpc/egrpc-codegen-native_1.85.4.bb`.
 
 ## Policy (design §4.5)
 

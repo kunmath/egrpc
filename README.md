@@ -146,9 +146,9 @@ example is in [examples/resilient_subscribe](examples/resilient_subscribe/README
 ## Supported `grpc_cpp_plugin` version
 
 `grpc::internal` is unstable upstream, so each egrpc release pins one code
-generator. **v0.1 supports stubs from gRPC v1.82.0 `grpc_cpp_plugin`** (default
+generator. **v0.1 supports stubs from gRPC v1.85.4 `grpc_cpp_plugin`** (default
 options, lite-compatible protos), built by `tools/pin-codegen.sh` together with
-protoc 35.0. CI regenerates the checked-in stubs and fails on drift. Message
+protoc 35.1. CI regenerates the checked-in stubs and fails on drift. Message
 code (`.pb.{h,cc}`) must come from a `protoc` matching your protobuf runtime.
 See [docs/codegen-pinning.md](docs/codegen-pinning.md) and
 [docs/porting-guide.md](docs/porting-guide.md).
