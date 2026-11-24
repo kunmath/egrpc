@@ -71,8 +71,9 @@ per egrpc release**, verified in CI by regenerating stubs and compiling.
 - **M2 — HTTP/2 session + keepalive plumbing: done**
 - **M3 — Hand-rolled unary call end-to-end: done**
 - **M4 — Shim: unary via unmodified generated stubs: done**
-- Pre-M5 gate (§8a): scarthgap bitbake spike validating the protobuf matrix —
-  scarthgap is the sole supported Yocto LTS for v0.1 (decided)
+- **Pre-M5 gate (§8a) — scarthgap bitbake spike: done** (`qemuarm64`, GCC 13.5.0,
+  protobuf 4.25.8, nghttp2 1.61.0, OpenSSL 3.5.9 — see `docs/yocto-spike.md`;
+  scarthgap is the sole supported Yocto LTS for v0.1)
 - **M5 — Server-streaming + deadlines + cancellation: done**
 - **M6 — Resilience: reconnect, keepalive enforcement, shutdown: done**
 - **M7 — resilient_stream + native config API: done**
@@ -100,8 +101,12 @@ thread-ownership §3, wire format §5, TSan/ASan hazards — run before every co
 ## Coding standards
 
 - **C++17**, CMake ≥ 3.16. Warnings-as-errors (`-Wall -Wextra -Werror`).
-- **No Abseil.** Runtime deps are exactly nghttp2, OpenSSL, protobuf-lite — found
-  via find_package/pkg-config on the system; no vendoring in the default path.
+- **No Abseil in egrpc.** egrpc's own runtime deps are nghttp2, OpenSSL, and
+  protobuf-lite — found via find_package/pkg-config on the system; no vendoring
+  in the default path (`libegrpc.so` itself has zero Abseil linkage). Note for
+  M8 Yocto packaging: scarthgap's `protobuf 4.25.8` runtime transitively pulls
+  in `abseil-cpp` (`20240116`), so target images using generated protobuf stubs
+  must ship `abseil-cpp` alongside `protobuf`.
 - **TSan+ASan(+UBSan) clean is mandatory**, CI-enforced from M1 on. The condvar-
   heavy design makes data races the top project risk — treat sanitizer findings
   as blockers, never suppressions.
