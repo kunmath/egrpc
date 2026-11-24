@@ -45,7 +45,7 @@ when a case fails, and 2 on a usage error.
 | `server_streaming` | `StreamingOutputCall` | Same as upstream: response sizes 31415, 9, 2653, 58979. |
 | `status_code_and_message` | `UnaryCall` + `StreamingOutputCall` | Upstream uses `UnaryCall` + `FullDuplexCall`. egrpc has no bidi support, so `StreamingOutputCall` covers the streaming half. Both expect `UNKNOWN` / `"test status message"`. |
 | `custom_metadata` | `UnaryCall` | Upstream also runs a `FullDuplexCall` leg. egrpc checks the unary leg only: the initial echo plus the 6-byte `-bin` trailing echo. |
-| `timeout_on_sleeping_server` | `StreamingOutputCall` | Adapted. Upstream uses bidi `FullDuplexCall`. egrpc sends a `response_parameters` entry with `interval_us = 10 s` so the server sleeps, then expects `DEADLINE_EXCEEDED` within the 100 ms deadline. |
+| `timeout_on_sleeping_server` | `StreamingOutputCall` | Adapted. Upstream uses bidi `FullDuplexCall`. egrpc sends a `response_parameters` entry with `interval_us = 10 s` so the server sleeps, then expects `DEADLINE_EXCEEDED`. The `ClientContext` deadline is 100 ms; the acceptance bound is a looser `< 5000 ms` wall-clock elapsed time to tolerate slow CI hosts. |
 | `cancel_after_begin` | `StreamingOutputCall` | Adapted. Upstream uses client-streaming `StreamingInputCall`. egrpc calls `TryCancel()` on a sleeping server-streaming call right after it starts, then expects `CANCELLED`. |
 | `unimplemented_method` | `UnimplementedCall` | Same as upstream: expects `UNIMPLEMENTED`. |
 

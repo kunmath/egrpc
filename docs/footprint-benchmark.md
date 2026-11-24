@@ -152,7 +152,13 @@ passed):
    - `libprotobuf32t64`, `libprotobuf-lite32t64`, `libprotobuf-dev`,
      `libprotoc32t64` and `protobuf-compiler` at 3.21.12-8.2ubuntu0.4.
 
-   OpenSSL (3.0.13), zlib and nghttp2 (1.59.0) come from the host.
+   OpenSSL (3.0.13), zlib and nghttp2 (1.59.0) come from the host. The
+   measured baseline used egrpc commit `3207147` and these host packages
+   (`dpkg-query -W -f='${Package} ${Version}\n' libnghttp2-dev libssl-dev libprotobuf-dev zlib1g`):
+   - `libnghttp2-dev` 1.59.0-1ubuntu0.4;
+   - `libprotobuf-dev` 3.21.12-8.2ubuntu0.4;
+   - `libssl-dev` 3.0.13-0ubuntu3.16;
+   - `zlib1g` 1:1.3.dfsg-3.1ubuntu2.3.
 3. **Compile `bench_client.cc`.** The script embeds this source, which compiles
    unchanged against both libraries. The client creates a TLS channel and calls
    `GetFeature(1000, 2000)`. It then calls `ListFeatures(0,0,0,0)` and requires

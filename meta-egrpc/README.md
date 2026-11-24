@@ -55,6 +55,7 @@ the target:
 DEPENDS += "egrpc protobuf protobuf-native egrpc-codegen-native"
 
 do_configure:prepend() {
+    install -d ${S}/gen
     ${STAGING_BINDIR_NATIVE}/protoc --proto_path=${S}/proto \
         --cpp_out=${S}/gen \
         --plugin=protoc-gen-grpc=${STAGING_BINDIR_NATIVE}/egrpc-grpc_cpp_plugin \

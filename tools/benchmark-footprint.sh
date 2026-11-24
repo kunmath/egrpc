@@ -51,7 +51,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "${PYTHON:-}" ]]; then
-  for cand in "$REPO_ROOT/.venv/bin/python" /home/kunal/my_space/egrpc/.venv/bin/python python3; do
+  for cand in "$REPO_ROOT/.venv/bin/python" python3; do
     if command -v "$cand" >/dev/null 2>&1 && "$cand" -c 'import grpc, grpc_tools' 2>/dev/null; then
       PYTHON="$cand"
       break

@@ -16,12 +16,16 @@ on:
     paths:
       - "examples/route_guide/route_guide.proto"
       - "examples/route_guide/gen/**"
+      - "tests/interop/proto/**"
+      - "tests/interop/gen/**"
       - "tools/pin-codegen.sh"
       - ".github/workflows/codegen.yml"
   pull_request:
     paths:
       - "examples/route_guide/route_guide.proto"
       - "examples/route_guide/gen/**"
+      - "tests/interop/proto/**"
+      - "tests/interop/gen/**"
       - "tools/pin-codegen.sh"
       - ".github/workflows/codegen.yml"
   workflow_dispatch:
@@ -55,3 +59,11 @@ jobs:
             --grpc_out="$out" examples/route_guide/route_guide.proto
           diff -u "$out/route_guide.grpc.pb.h" examples/route_guide/gen/route_guide.grpc.pb.h
           diff -u "$out/route_guide.grpc.pb.cc" examples/route_guide/gen/route_guide.grpc.pb.cc
+      - name: Regenerate interop test stubs and diff against checked-in copies
+        run: |
+          out=$(mktemp -d)
+          tools/bin/protoc -I tests/interop/proto \
+            --plugin=protoc-gen-grpc=tools/bin/grpc_cpp_plugin \
+            --grpc_out="$out" tests/interop/proto/src/proto/grpc/testing/test.proto
+          diff -u "$out/src/proto/grpc/testing/test.grpc.pb.h" tests/interop/gen/src/proto/grpc/testing/test.grpc.pb.h
+          diff -u "$out/src/proto/grpc/testing/test.grpc.pb.cc" tests/interop/gen/src/proto/grpc/testing/test.grpc.pb.cc

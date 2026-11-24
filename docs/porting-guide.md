@@ -49,6 +49,7 @@ tools/pin-codegen.sh   # builds the pinned grpc_cpp_plugin v1.82.0 + protoc 35.0
 
 # Message code: protoc matching the host runtime (protoc 21.12 for Ubuntu's
 # libprotobuf-dev 3.21.12).
+mkdir -p gen
 protoc -I proto --cpp_out=gen proto/my_service.proto
 
 # Stub code: pinned plugin.
@@ -73,6 +74,7 @@ v1.82.0 cleanly (verified empirically). From an application recipe:
 DEPENDS += "egrpc protobuf protobuf-native egrpc-codegen-native"
 
 do_configure:prepend() {
+    install -d ${S}/gen
     ${STAGING_BINDIR_NATIVE}/protoc --proto_path=${S}/proto \
         --cpp_out=${S}/gen \
         --plugin=protoc-gen-grpc=${STAGING_BINDIR_NATIVE}/egrpc-grpc_cpp_plugin \
@@ -157,7 +159,9 @@ Generated code for these compiles unchanged, but calls fail with
 - client-streaming and bidirectional-streaming methods (`ClientWriter`,
   `ClientReaderWriter`);
 - the async API (`grpc::CompletionQueue`, `PrepareAsync*`/`Async*` stubs):
-  tags come back with `ok = true` after an `UNIMPLEMENTED` status is deposited;
+  only `Finish` comes back with `ok = true`, after an `UNIMPLEMENTED` status
+  is deposited; every other tagged operation (`Read`, `Write`,
+  `ReadInitialMetadata`, `WritesDone`, …) comes back with `ok = false`;
 - server-side generated classes (`Service`, `AsyncService`, …) exist only so
   generated files compile. egrpc has no server.
 
