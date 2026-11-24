@@ -99,15 +99,18 @@ docs/yocto-spike.md), executed 2026-11-24:
   `egrpc_route_guide_client` links 2 directly via protobuf gencode/headers.
   Target images that use generated stubs must ship abseil-cpp.
 
-Open item (M4 CI wiring, extended to M8): the pinned `grpc_cpp_plugin`
-(built on protobuf 35.0) must accept the CodeGeneratorRequest produced by
-whichever protoc drives it — 21.12 on CI, 25.x inside the Yocto recipe.
-Verify per driver (still untested for 25.x: `tools/bin/grpc_cpp_plugin` was
-not built during the 2026-11-24 spike, which used the checked-in v1.82.0 stub
-copies; deferred to M8); if a driver's request is rejected, drive the plugin from
-the pinned protoc 35.0 instead (the plugin emits no message code, so the
-runtime match constraint does not apply to its output — only the `.pb.*`
-generation must use the runtime-matched protoc).
+Resolved (M8, scarthgap 5.0.21, `qemuarm64`, 2026-11-24): scarthgap's
+`protobuf-native` **protoc 25.8 drives the pinned `grpc_cpp_plugin` v1.82.0
+cleanly**. `meta-egrpc/recipes-devtools/egrpc/egrpc-codegen-native_1.82.0.bb`
+builds the plugin host-side (static Abseil 20250512.1 → static protobuf 35.0
+libprotoc → plugin only, same SHA-256-pinned tarballs as `tools/pin-codegen.sh`)
+and installs it as `egrpc-grpc_cpp_plugin`. With `PACKAGECONFIG:pn-egrpc =
+"examples"`, `egrpc_git.bb` regenerates `route_guide.pb.*` and
+`route_guide.grpc.pb.*` in one protoc 25.8 invocation; the regenerated
+`.grpc.pb.{h,cc}` are byte-identical to the checked-in v1.82.0 stubs, and
+`egrpc_route_guide_client` compiles and links for aarch64 with zero warnings.
+The pinned protoc 35.0 is therefore **not** needed inside Yocto. (The protoc
+21.12 CI driver remains covered by the M4 CI stub-regeneration job.)
 
 ## Policy (design §4.5)
 

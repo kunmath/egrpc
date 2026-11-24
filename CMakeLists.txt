@@ -136,3 +136,9 @@ install(TARGETS egrpc_static egrpc_shared
 install(DIRECTORY include/grpcpp include/egrpc
   DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
+
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/cmake/egrpc.pc.in
+  ${CMAKE_CURRENT_BINARY_DIR}/egrpc.pc @ONLY)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/egrpc.pc
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
+)
