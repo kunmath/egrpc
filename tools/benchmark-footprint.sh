@@ -19,6 +19,8 @@
 # openssl CLI, apt-get, dpkg-deb, binutils, and the egrpc build deps
 # (libssl-dev, libnghttp2-dev, libprotobuf-dev incl. static archives).
 set -euo pipefail
+# Make command substitutions ($(...)) honour errexit too (bash >= 4.4).
+shopt -s inherit_errexit
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KEEP_TMP=0
@@ -29,7 +31,11 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --keep-tmp) KEEP_TMP=1 ;;
     --runs)
-      RUNS="${2:?--runs needs a value}"
+      if [[ $# -lt 2 || ! "$2" =~ ^[1-9][0-9]*$ ]]; then
+        echo "--runs needs a positive integer" >&2
+        exit 2
+      fi
+      RUNS="$2"
       shift
       ;;
     -h | --help)
@@ -89,12 +95,19 @@ strip_copy() {
   local mode="$1" src="$2"
   local dst
   dst="$WORK/stripped/$(basename "$src").$mode.$RANDOM$RANDOM"
-  mkdir -p "$WORK/stripped"
-  cp "$(readlink -f "$src")" "$dst"
-  strip "--strip-$mode" "$dst"
+  mkdir -p "$WORK/stripped" || return 1
+  cp "$(readlink -f "$src")" "$dst" || return 1
+  if ! strip "--strip-$mode" "$dst"; then
+    echo "strip --strip-$mode failed: $src" >&2
+    return 1
+  fi
   echo "$dst"
 }
-stripped_size() { size_of "$(strip_copy "$1" "$2")"; }
+stripped_size() {
+  local tmp
+  tmp="$(strip_copy "$1" "$2")" || return 1
+  size_of "$tmp"
+}
 
 human() {
   awk -v b="$1" 'BEGIN {
@@ -119,15 +132,24 @@ closure() {
     sort -u || true
 }
 closure_stripped_total() {
-  local total=0 f
+  local total=0 f sz
   while read -r f; do
     [[ -n "$f" ]] || continue
-    total=$((total + $(stripped_size unneeded "$f")))
+    sz="$(stripped_size unneeded "$f")" || return 1
+    total=$((total + sz))
   done
   echo "$total"
 }
 
-median() { sort -n | awk '{ a[NR] = $1 } END { print a[int((NR + 1) / 2)] }'; }
+# Conventional median; an even count averages the middle pair (rounded half up).
+median() {
+  sort -n | awk '{ a[NR] = $1 }
+    END {
+      if (NR == 0) exit 1
+      if (NR % 2) print a[(NR + 1) / 2]
+      else print int((a[NR / 2] + a[NR / 2 + 1]) / 2 + 0.5)
+    }'
+}
 
 # ------------------------------------------------------- bench_client.cc ---
 mkdir -p "$WORK/src"
@@ -357,12 +379,16 @@ EG_BIN_NEEDED="$(readelf -d "$WORK/egrpc_bench_shared" | awk '/NEEDED/ { gsub(/[
 EG_NEEDED_N=$(wc -w <<<"$EG_BIN_NEEDED")
 
 closure_rows() {
-  local f
+  local f sz
   while read -r f; do
     [[ -n "$f" ]] || continue
-    echo "| \`$(basename "$f")\` | $(stripped_size unneeded "$f") |"
+    sz="$(stripped_size unneeded "$f")" || return 1
+    echo "| \`$(basename "$f")\` | $sz |"
   done
 }
+
+EG_CLOSURE_ROWS="$(closure_rows <<<"$EG_CLOSURE")"
+UP_CLOSURE_ROWS="$(closure_rows <<<"$UP_CLOSURE")"
 
 declare -A BIN_STRIP BIN_RAW
 for b in egrpc_bench_shared egrpc_bench_static egrpc_bench_fullstatic \
@@ -501,14 +527,14 @@ egrpc (\`libegrpc.so\` NEEDED: $EG_NEEDED; client NEEDED: $EG_BIN_NEEDED)
 
 | Library | stripped bytes |
 |---|---|
-$(closure_rows <<<"$EG_CLOSURE")
+$EG_CLOSURE_ROWS
 | **total ($EG_CLOSURE_N libs)** | $EG_CLOSURE_SIZE |
 
 upstream (client NEEDED: $UP_NEEDED)
 
 | Library | stripped bytes |
 |---|---|
-$(closure_rows <<<"$UP_CLOSURE")
+$UP_CLOSURE_ROWS
 | **total ($UP_CLOSURE_N libs)** | $UP_CLOSURE_SIZE |
 
 ## Client binaries (bytes)
