@@ -114,6 +114,7 @@ if(EGRPC_BUILD_TESTS)
   include(CTest)
   add_subdirectory(tests/unit)
   add_subdirectory(tests/integration)
+  add_subdirectory(tests/interop)
 endif()
 
 option(EGRPC_BUILD_EXAMPLES "Build examples (M4 shim acceptance)" ${_egrpc_is_top})
@@ -134,4 +135,20 @@ install(TARGETS egrpc_static egrpc_shared
 
 install(DIRECTORY include/grpcpp include/egrpc
   DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+
+if(IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}")
+  set(EGRPC_PC_LIBDIR "${CMAKE_INSTALL_LIBDIR}")
+else()
+  set(EGRPC_PC_LIBDIR "\${exec_prefix}/${CMAKE_INSTALL_LIBDIR}")
+endif()
+if(IS_ABSOLUTE "${CMAKE_INSTALL_INCLUDEDIR}")
+  set(EGRPC_PC_INCLUDEDIR "${CMAKE_INSTALL_INCLUDEDIR}")
+else()
+  set(EGRPC_PC_INCLUDEDIR "\${prefix}/${CMAKE_INSTALL_INCLUDEDIR}")
+endif()
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/cmake/egrpc.pc.in
+  ${CMAKE_CURRENT_BINARY_DIR}/egrpc.pc @ONLY)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/egrpc.pc
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
 )

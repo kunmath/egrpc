@@ -109,8 +109,9 @@ jobs:
       - name: Check formatting
         run: |
           # third_party is vendored; examples/*/gen is protoc/grpc_cpp_plugin
-          # output checked in verbatim (M4) — neither is ours to format.
-          files=$(git ls-files '*.h' '*.cc' | grep -v -e '^third_party/' -e '^examples/.*/gen/' || true)
+          # output checked in verbatim (M4), as is tests/interop/gen (M8) —
+          # none of it is ours to format.
+          files=$(git ls-files '*.h' '*.cc' | grep -v -e '^third_party/' -e '^examples/.*/gen/' -e '^tests/interop/gen/' || true)
           if [ -z "$files" ]; then
             echo "No files to check."
             exit 0

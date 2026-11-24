@@ -77,7 +77,7 @@ per egrpc release**, verified in CI by regenerating stubs and compiling.
 - **M5 — Server-streaming + deadlines + cancellation: done**
 - **M6 — Resilience: reconnect, keepalive enforcement, shutdown: done**
 - **M7 — resilient_stream + native config API: done**
-- M8 — Interop subset, Yocto layer, docs: not started
+- **M8 — Interop subset, Yocto layer, docs: done**
 
 Each milestone lands independently with green CI and its acceptance test from §8.
 

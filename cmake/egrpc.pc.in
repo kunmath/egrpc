@@ -1,0 +1,11 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+exec_prefix=${prefix}
+libdir=@EGRPC_PC_LIBDIR@
+includedir=@EGRPC_PC_INCLUDEDIR@
+
+Name: egrpc
+Description: Lightweight client-only gRPC C++ library for embedded Linux
+Version: @PROJECT_VERSION@
+Requires.private: libnghttp2 openssl protobuf-lite
+Libs: -L${libdir} -legrpc
+Cflags: -I${includedir}
