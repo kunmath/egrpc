@@ -141,13 +141,18 @@ closure_stripped_total() {
   echo "$total"
 }
 
-# Conventional median; an even count averages the middle pair (rounded half up).
+# Conventional median; an even count averages the middle pair exactly
+# (integer when the pair sum is even, otherwise "<int>.5").
 median() {
   sort -n | awk '{ a[NR] = $1 }
     END {
       if (NR == 0) exit 1
       if (NR % 2) print a[(NR + 1) / 2]
-      else print int((a[NR / 2] + a[NR / 2 + 1]) / 2 + 0.5)
+      else {
+        s = a[NR / 2] + a[NR / 2 + 1]
+        if (s % 2 == 0) print s / 2
+        else printf "%d.5\n", (s - 1) / 2
+      }
     }'
 }
 
